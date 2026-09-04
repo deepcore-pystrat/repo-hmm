@@ -1,0 +1,658 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from features.registry import standardize
+from models import StudentTHMMConfig, GaussianHMMConfig, create_hmm
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+SPOT_PATH = r"D:\Downloads\deepcore--2026-04-07-12_42-0026205d-213a-4e96-bbe9-a7c977a1c3d4.xlsx"
+FUTURES_PATH = r"D:\Downloads\Futures CBOT Corn.csv"
+
+NB_STATES = 3
+HMM_TYPE = "student"
+COV_TYPE = "diag"
+N_ITER = 100
+SEED = 42
+MULTI_START_SEEDS = [0, 1, 2, 42, 123]
+
+TRAIN_RATIO = 0.7
+HMM_WINDOW = 20
+
+from scipy.stats import norm
+
+
+from scipy.stats import norm
+
+
+def logit_transform(p, eps=1e-6):
+    p = np.clip(p, eps, 1 - eps)
+    return np.log(p / (1 - p))
+
+
+def bocpd_gaussian_mean(x, hazard=1/80, mu0=0.0, sigma0=5.0, sigma=1.0):
+    x = np.asarray(x, dtype=float)
+    T = len(x)
+
+    R = np.zeros((T + 1, T + 1))
+    R[0, 0] = 1.0
+
+    mu = np.full(T + 1, mu0)
+    var = np.full(T + 1, sigma0**2)
+
+    cp_prob = np.zeros(T)
+    map_run = np.zeros(T, dtype=int)
+
+    for t in range(1, T + 1):
+        xt = x[t - 1]
+
+        pred_mean = mu[:t]
+        pred_var = sigma**2 + var[:t]
+
+        pred_prob = norm.pdf(
+            xt,
+            loc=pred_mean,
+            scale=np.sqrt(pred_var)
+        )
+
+        growth = R[t - 1, :t] * pred_prob * (1 - hazard)
+        cp = np.sum(R[t - 1, :t] * pred_prob * hazard)
+
+        R[t, 1:t + 1] = growth
+        R[t, 0] = cp
+
+        R[t, :t + 1] /= np.sum(R[t, :t + 1]) + 1e-12
+
+        cp_prob[t - 1] = R[t, 0]
+        map_run[t - 1] = np.argmax(R[t, :t + 1])
+
+        old_mu = mu.copy()
+        old_var = var.copy()
+
+        var[1:t + 1] = 1 / (1 / old_var[:t] + 1 / sigma**2)
+        mu[1:t + 1] = var[1:t + 1] * (
+            old_mu[:t] / old_var[:t] + xt / sigma**2
+        )
+
+        mu[0] = mu0
+        var[0] = sigma0**2
+
+    return R, cp_prob, map_run
+def diagnose_proba_distribution(proba0):
+    import matplotlib.pyplot as plt
+
+    # logit transform
+    eps = 1e-6
+    p = np.clip(proba0, eps, 1 - eps)
+    logit_p = np.log(p / (1 - p))
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # ---- Raw proba histogram ----
+    axes[0, 0].hist(proba0, bins=50)
+    axes[0, 0].set_title("Histogram P(state 0)")
+
+    # ---- Raw time series ----
+    axes[0, 1].plot(proba0)
+    axes[0, 1].set_title("Time series P(state 0)")
+
+    # ---- Logit histogram ----
+    axes[1, 0].hist(logit_p, bins=50)
+    axes[1, 0].set_title("Histogram logit(P)")
+
+    # ---- Logit time series ----
+    axes[1, 1].plot(logit_p)
+    axes[1, 1].set_title("Time series logit(P)")
+
+    plt.tight_layout()
+    plt.show()
+
+    return logit_p
+def plot_bocpd_breakpoints(index, proba0, cp_prob, map_run_length, cp_threshold=0.3):
+    breaks = np.where(cp_prob > cp_threshold)[0]
+
+    plt.figure(figsize=(16, 5))
+    plt.plot(index, proba0, label="P(state 0)", color="black")
+
+    for b in breaks:
+        plt.axvline(index[b], color="red", alpha=0.6)
+
+    plt.title("BOCPD sur P(state 0) - points de rupture")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    plt.figure(figsize=(16, 4))
+    plt.plot(index, cp_prob, label="P(r_t = 0 | x_1:t)")
+    plt.axhline(cp_threshold, linestyle="--", label="seuil rupture")
+
+    for b in breaks:
+        plt.axvline(index[b], color="red", alpha=0.4)
+
+    plt.title("Probabilité de change-point selon BOCPD")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    plt.figure(figsize=(16, 4))
+    plt.plot(index, map_run_length)
+    plt.title("Run length MAP")
+    plt.grid()
+    plt.show()
+
+    return breaks
+# ============================================================
+# DATA
+# ============================================================
+
+def load_spot_data():
+    spot = pd.read_excel(SPOT_PATH, skiprows=1)
+    spot.columns = spot.columns.str.strip()
+
+    spot["DATE"] = pd.to_datetime(spot["DATE"], errors="coerce")
+    spot["BID"] = pd.to_numeric(spot["BID"], errors="coerce")
+    spot["OFFER"] = pd.to_numeric(spot["OFFER"], errors="coerce")
+
+    spot["MID"] = (spot["BID"] + spot["OFFER"]) / 2
+    spot["BA_SPREAD"] = spot["OFFER"] - spot["BID"]
+
+    spot = spot.rename(columns={"DATE": "Date"})
+    spot = spot[["Date", "BID", "OFFER", "MID", "BA_SPREAD"]]
+    spot = spot.dropna()
+    spot = spot.sort_values("Date").groupby("Date", as_index=False).last()
+
+    return spot
+
+def build_regime0_from_breaks(n, breaks, proba0):
+    regime = np.zeros(n, dtype=int)
+
+    current = 0  # 0 = hors régime, 1 = régime 0
+
+    last = 0
+
+    for b in breaks:
+        regime[last:b] = current
+
+        # flip régime
+        current = 1 - current
+        last = b
+
+    regime[last:] = current
+
+    # IMPORTANT : décider le premier état
+    if np.mean(proba0[:10]) > 0.5:
+        regime = 1 - regime
+
+    return regime
+def load_futures_data():
+    fut = pd.read_csv(FUTURES_PATH, sep=";")
+    fut.columns = fut.columns.str.strip()
+
+    fut["Date"] = pd.to_datetime(fut["Date"], errors="coerce")
+    fut["Close"] = pd.to_numeric(fut["Close"], errors="coerce")
+
+    fut = fut[["Date", "Close"]]
+    fut = fut.dropna()
+    fut = fut.sort_values("Date").groupby("Date", as_index=False).last()
+    fut = fut.rename(columns={"Close": "FUTURES_CLOSE"})
+
+    return fut
+
+
+def build_full_dataset():
+    spot = load_spot_data()
+    fut = load_futures_data()
+
+    data = pd.merge(spot, fut, on="Date", how="inner")
+    data = data.sort_values("Date")
+
+    data = data.set_index("Date")
+    return data
+
+
+# ============================================================
+# FEATURES
+# ============================================================
+
+def rolling_slope(series, window=20):
+    x = np.arange(window)
+
+    def _slope(y):
+        if np.isnan(y).any():
+            return np.nan
+        return np.polyfit(x, y, 1)[0]
+
+    return series.rolling(window).apply(_slope, raw=True)
+def detect_regime_changes(proba, threshold=0.8, min_duration=5):
+    """
+    Détecte les vrais changements de régime :
+    - passage durable 0 → 1 ou 1 → 0
+    """
+    proba = np.asarray(proba)
+
+    state = (proba > threshold).astype(int)
+
+    breaks = []
+
+    for t in range(1, len(state)):
+        if state[t] != state[t-1]:
+            # vérifier stabilité après le changement
+            end = min(t + min_duration, len(state))
+            if np.all(state[t:end] == state[t]):
+                breaks.append(t)
+
+    return np.array(breaks)
+
+def compute_rsi(price, window=14):
+    delta = price.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(window).mean()
+    avg_loss = loss.rolling(window).mean()
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+def detect_probability_changepoints(proba, index=None, threshold=0.5, min_distance=5):
+    proba = np.asarray(proba)
+    dp = np.abs(np.diff(proba, prepend=proba[0]))
+
+    candidates = np.where(dp >= threshold)[0]
+
+    breaks = []
+    last = -min_distance
+
+    for c in candidates:
+        if c - last >= min_distance:
+            breaks.append(c)
+            last = c
+        else:
+            # garder le plus gros saut dans une zone proche
+            if dp[c] > dp[breaks[-1]]:
+                breaks[-1] = c
+                last = c
+
+    return np.array(breaks), dp
+def plot_probability_changepoints(index, proba, breaks, dp):
+    plt.figure(figsize=(18, 5))
+    plt.plot(index, proba, color="black", label="P(state 0)")
+
+    for b in breaks:
+        plt.axvline(index[b], color="red", linestyle="--", alpha=0.8)
+
+    plt.title("Change-points détectés sur P(state 0)")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+    plt.figure(figsize=(18, 4))
+    plt.plot(index, dp, label="|Δ P(state 0)|")
+
+    for b in breaks:
+        plt.axvline(index[b], color="red", linestyle="--", alpha=0.8)
+
+    plt.title("Amplitude des changements de probabilité")
+    plt.legend()
+    plt.grid()
+    plt.show()
+def build_hmm_features(df, window=20):
+    out = pd.DataFrame(index=df.index)
+
+    mid = df["MID"]
+    bid = df["BID"]
+    offer = df["OFFER"]
+
+    log_mid = np.log(mid)
+    r = log_mid.diff()
+
+    rel_spread = (offer - bid) / mid
+
+    # =========================
+    # 1. PRICE / MOMENTUM
+    # =========================
+    out["r_mid"] = r
+
+    out["mom_10"] = log_mid.diff(10)
+    out["mom_20"] = log_mid.diff(20)
+
+    
+
+    out["trend_slope_20"] = rolling_slope(log_mid, window=20)
+
+
+    # =========================
+    # 2. VOLATILITY / CRISIS
+    # =========================
+    out["vol_10"] = r.rolling(10).std()
+    out["vol_20"] = r.rolling(20).std()
+
+    out["vol_ratio_10_60"] = (
+        r.rolling(10).std()
+        / r.rolling(60).std()
+    )
+
+    
+
+    # =========================
+    # 3. BID-ASK / LIQUIDITY
+    # =========================
+    out["rel_spread"] = rel_spread
+
+    
+
+    
+
+    out["illiq"] = rel_spread * np.abs(r)
+
+    
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out = out.dropna()
+
+    return out
+
+# ============================================================
+# HMM
+# ============================================================
+
+def fit_hmm(X):
+    if HMM_TYPE == "student":
+        cfg = StudentTHMMConfig(
+    K=NB_STATES,
+    n_iter=N_ITER,
+    seed=SEED,
+    cov_type=COV_TYPE,
+    sticky=50.0
+)
+    else:
+        cfg = GaussianHMMConfig(K=NB_STATES, n_iter=N_ITER, seed=SEED)
+
+    model = create_hmm(cfg)
+
+    if hasattr(model, "fit_multi_start"):
+        result = model.fit_multi_start(X, seeds=MULTI_START_SEEDS)
+    else:
+        result = model.fit(X)
+
+    return model, result
+
+
+def reorder_states(states, probas, returns):
+    df = pd.DataFrame({"state": states, "ret": returns})
+    means = df.groupby("state")["ret"].mean().sort_values()
+
+    mapping = {old: new for new, old in enumerate(means.index)}
+
+    states_new = np.array([mapping[s] for s in states])
+
+    probas_new = np.zeros_like(probas)
+    for old, new in mapping.items():
+        probas_new[:, new] = probas[:, old]
+
+    return states_new, probas_new, mapping
+
+
+def apply_mapping(states, probas, mapping):
+    states_new = np.array([mapping[s] for s in states])
+
+    probas_new = np.zeros_like(probas)
+    for old, new in mapping.items():
+        probas_new[:, new] = probas[:, old]
+
+    return states_new, probas_new
+
+
+# ============================================================
+# PLOTS
+# ============================================================
+
+def plot_probs(index, probas):
+    plt.figure(figsize=(15,5))
+    for k in range(probas.shape[1]):
+        plt.plot(index, probas[:,k], label=f"state {k}")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+
+def plot_regimes_clean(df):
+    plt.figure(figsize=(18, 6))
+    plt.plot(df.index, df["MID"], color="black", linewidth=1.5)
+
+    colors = {
+        0: "red",
+        1: "green",
+        2: "blue",
+        3: "orange",
+    }
+
+    states = df["state"].values
+    index = df.index
+
+    start = 0
+    current_state = states[0]
+
+    for i in range(1, len(states)):
+        if states[i] != current_state:
+            plt.axvspan(
+                index[start],
+                index[i - 1],
+                color=colors[current_state],
+                alpha=0.25
+            )
+            start = i
+            current_state = states[i]
+
+    plt.axvspan(
+        index[start],
+        index[-1],
+        color=colors[current_state],
+        alpha=0.25
+    )
+
+    plt.title("Régimes HMM propres")
+    plt.grid()
+    plt.show()
+def plot_spot_regime0_clean(df, probas):
+    plt.figure(figsize=(18,6))
+
+    price = df["MID"].values
+    index = df.index
+    states = np.argmax(probas, axis=1)
+
+    plt.plot(index, price, color="black", linewidth=1.5)
+
+    in_regime = False
+    start = None
+
+    for i in range(len(states)):
+        if states[i] == 0 and not in_regime:
+            start = index[i]
+            in_regime = True
+
+        elif states[i] != 0 and in_regime:
+            plt.axvspan(start, index[i], color="green", alpha=0.3)
+            in_regime = False
+
+    if in_regime:
+        plt.axvspan(start, index[-1], color="green", alpha=0.3)
+
+    plt.title("Spot avec segments régime 0")
+    plt.grid()
+    plt.show()
+
+def plot_spot_regime0_final(df):
+    plt.figure(figsize=(18,6))
+
+    price = df["MID"].values
+    index = df.index
+    regime = df["regime0"].values
+
+    plt.plot(index, price, color="black", linewidth=1.5)
+
+    in_regime = False
+    start = None
+
+    for i in range(len(regime)):
+        if regime[i] == 1 and not in_regime:
+            start = index[i]
+            in_regime = True
+
+        elif regime[i] == 0 and in_regime:
+            plt.axvspan(start, index[i], color="green", alpha=0.3)
+            in_regime = False
+
+    if in_regime:
+        plt.axvspan(start, index[-1], color="green", alpha=0.3)
+
+    plt.title("Spot avec régime 0 (propre via change-points)")
+    plt.grid()
+    plt.show()
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    data = build_full_dataset()
+
+    split = int(len(data)*TRAIN_RATIO)
+
+    train = data.iloc[:split]
+    test = data.iloc[split:]
+
+    feat_train = build_hmm_features(train)
+    feat_test = build_hmm_features(test)
+
+    train = train.loc[feat_train.index]
+    test = test.loc[feat_test.index]
+
+    X_train = feat_train.values
+    X_test = feat_test.values
+
+    X_train, X_test, _, _ = standardize(X_train, X_test)
+
+    model, result = fit_hmm(X_train)
+
+    train_states, train_proba, _ = model.filter(X_train)
+
+    train_states, train_proba, mapping = reorder_states(
+        train_states,
+        train_proba,
+        feat_train["r_mid"].values
+    )
+
+    test_states, test_proba, _ = model.filter(X_test)
+
+    test_states, test_proba = apply_mapping(
+        test_states,
+        test_proba,
+        mapping
+    )
+
+    df = test.copy()
+    df["state"] = np.argmax(test_proba, axis=1)
+
+    plot_probs(df.index, test_proba)
+    plot_regimes_clean(df)
+    df = test.copy()
+    df["state"] = np.argmax(test_proba, axis=1)
+
+    proba0 = test_proba[:, 0]
+
+    sigma = np.std(proba0[:max(20, len(proba0)//5)])
+    sigma = max(sigma, 1e-3)
+
+    R, cp_prob, map_run_length = bocpd_gaussian_mean(
+        proba0,
+        hazard=1/50,
+        mu0=np.mean(proba0[:20]),
+        sigma0=1.0,
+        sigma=sigma
+    )
+
+    breaks = plot_bocpd_breakpoints(
+        df.index,
+        proba0,
+        cp_prob,
+        map_run_length,
+        cp_threshold=0.3
+    )
+
+    print("Points de rupture BOCPD :")
+    for b in breaks:
+        print(df.index[b], "P(state 0) =", proba0[b], "CP prob =", cp_prob[b])
+
+    
+    proba0 = test_proba[:, 0]
+
+    logit_p = diagnose_proba_distribution(proba0)
+    proba0 = test_proba[:, 0]
+
+    breaks, dp = detect_probability_changepoints(
+        proba0,
+        threshold=0.9,
+        min_distance=5
+    )
+
+    print("Change-points détectés :")
+    for b in breaks:
+        print(df.index[b], "P0 =", proba0[b], "|ΔP0| =", dp[b])
+
+    plot_probability_changepoints(
+        df.index,
+        proba0,
+        breaks,
+        dp
+    )
+    proba0 = test_proba[:, 0]
+
+    breaks = detect_regime_changes(
+        proba0,
+        threshold=0.8,
+        min_duration=5
+    )
+
+    plot_spot_regime0_clean(df, test_proba)
+    proba0 = test_proba[:, 0]
+
+    regime0 = build_regime0_from_breaks(
+        len(df),
+        breaks,
+        proba0
+    )
+
+    df["regime0"] = regime0
+    proba0 = test_proba[:, 0]
+
+    # 1. détecter breaks (tu l’as déjà)
+    breaks, dp = detect_probability_changepoints(
+        proba0,
+        threshold=0.9,
+        min_distance=5
+    )
+
+    # 2. construire régime propre
+    regime0 = build_regime0_from_breaks(
+        len(df),
+        breaks,
+        proba0
+    )
+
+    df["regime0"] = regime0
+
+    # 3. plot final
+    plot_spot_regime0_final(df)
+
+    df["ret"] = feat_test["r_mid"].values
+
+    print(df.groupby("state")["ret"].mean())
+    print(df.groupby("state")["vol_20"].mean())
+    print(df.groupby("state")["rel_spread"].mean())
+if __name__ == "__main__":
+    main()

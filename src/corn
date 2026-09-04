@@ -1,0 +1,2157 @@
+# ============================================================
+# HMM — Phase 1 : validation des régimes
+#                 Phase 2 : segmentation + plots (si OK)
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+import statsmodels.api as sm
+from scipy import stats
+
+from models import StudentTHMMConfig, GaussianHMMConfig, create_hmm
+from features.registry import standardize
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+SPOT_PATH    = r"D:\Downloads\deepcore--2026-04-07-12_42-0026205d-213a-4e96-bbe9-a7c977a1c3d4.xlsx"
+FUTURES_PATH = r"D:\Downloads\data_futures_corn.xlsx"
+
+NB_STATES   = 3
+HMM_TYPE    = "student"   # "student" | "gaussian"
+TRAIN_RATIO = 0.6
+SEED        = 42
+CLIP        = 3.5
+
+SELECTED_COLS = [
+    "spread_z_60",
+    "vol_ratio_20_120",
+    "efficiency_20",
+    "vr_5",
+    "days_to_contract_month",
+]
+# ============================================================
+# DATA
+# ============================================================
+def percentile_rank(x, ref):
+    ref = pd.Series(ref).replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(ref) == 0 or pd.isna(x):
+        return np.nan
+
+    return (ref <= x).mean()
+
+
+def build_reference_block_metrics(futures_price, window=20):
+    fut = futures_price.dropna()
+    logp = np.log(fut)
+    ret = logp.diff()
+
+    rows = []
+
+    for i in range(0, len(logp) - window):
+        p = logp.iloc[i:i + window]
+        r = ret.iloc[i:i + window].dropna()
+
+        if len(r) < 5:
+            continue
+
+        total_ret = p.iloc[-1] - p.iloc[0]
+        abs_ret = abs(total_ret)
+        path_len = r.abs().sum()
+
+        efficiency = abs_ret / (path_len + 1e-8)
+        realized_vol = r.std()
+        block_range = p.max() - p.min()
+
+        acf1 = r.autocorr(lag=1) if len(r) > 5 else np.nan
+        vr5 = variance_ratio(p, lag=5) if len(p) > 10 else np.nan
+
+        signs = np.sign(r.values)
+        signs = signs[signs != 0]
+
+        run_ratio = np.nan
+        sign_change_ratio = np.nan
+
+        if len(signs) > 1:
+            sign_change_ratio = np.mean(signs[1:] != signs[:-1])
+
+            max_run = 1
+            cur_run = 1
+
+            for j in range(1, len(signs)):
+                if signs[j] == signs[j - 1]:
+                    cur_run += 1
+                else:
+                    max_run = max(max_run, cur_run)
+                    cur_run = 1
+
+            max_run = max(max_run, cur_run)
+            run_ratio = max_run / len(signs)
+
+        rows.append({
+            "abs_ret": abs_ret,
+            "efficiency": efficiency,
+            "realized_vol": realized_vol,
+            "block_range": block_range,
+            "acf1": acf1,
+            "vr5": vr5,
+            "run_ratio": run_ratio,
+            "sign_change_ratio": sign_change_ratio,
+        })
+
+    return pd.DataFrame(rows)
+def add_contract_calendar_feature(out, df):
+    month_map = {
+        "F": 1, "G": 2, "H": 3, "J": 4, "K": 5, "M": 6,
+        "N": 7, "Q": 8, "U": 9, "V": 10, "X": 11, "Z": 12
+    }
+
+    fut = df["FUTURES"].astype(str)
+
+    tmp = fut.str.extract(
+        r"ZC(?P<spot_month>[FGHJKMNQUVXZ])\s*(?P<future_month>[FGHJKMNQUVXZ])?(?P<yy>\d{2})"
+    )
+
+    contract_month_code = tmp["future_month"].fillna(tmp["spot_month"])
+    contract_month = contract_month_code.map(month_map)
+    contract_year = tmp["yy"].astype(float) + 2000
+
+    date = pd.to_datetime(df.index)
+
+    contract_month_start = pd.to_datetime(
+        pd.DataFrame({
+            "year": contract_year.astype(int),
+            "month": contract_month.astype(int),
+            "day": 1,
+        })
+    )
+
+    out["days_to_contract_month"] = (
+        contract_month_start.values.astype("datetime64[ns]")
+        - date.values.astype("datetime64[ns]")
+    ).astype("timedelta64[D]").astype(int)
+
+    return out
+def futures_structure_by_spot_regime(blocks, futures_price):
+    fut = futures_price.dropna()
+    logp = np.log(fut)
+    ret = logp.diff()
+    rows = []
+
+    for _, row in blocks.iterrows():
+        s = int(row["state"])
+        start, end = row["start"], row["end"]
+
+        if start not in fut.index or end not in fut.index:
+            continue
+
+        p = logp.loc[start:end]
+        r = ret.loc[start:end]
+
+        if len(p) < 5:
+            continue
+
+        total_ret = p.iloc[-1] - p.iloc[0]
+        path_len = r.abs().sum()
+        efficiency = abs(total_ret) / (path_len + 1e-8)
+        realized_vol = r.std()
+        direction = np.sign(total_ret)
+
+        if efficiency > 0.55 and direction > 0:
+            regime_type = "TREND_UP"
+        elif efficiency > 0.55 and direction < 0:
+            regime_type = "TREND_DOWN"
+        elif realized_vol > ret.rolling(60).std().median():
+            regime_type = "CHOPPY_HIGH_VOL"
+        else:
+            regime_type = "SIDEWAYS"
+
+        rows.append({
+            "spot_state": s,
+            "start": start,
+            "end": end,
+            "duration": len(p),
+            "fut_ret": total_ret,
+            "fut_efficiency": efficiency,
+            "fut_realized_vol": realized_vol,
+            "fut_type": regime_type,
+        })
+
+    res = pd.DataFrame(rows)
+
+    print("\n=== Structure FUTURES à l'intérieur des régimes SPOT ===")
+    print(res.groupby(["spot_state", "fut_type"]).size())
+
+    print("\n=== Moyennes par régime spot ===")
+    print(res.groupby("spot_state")[[
+        "fut_ret", "fut_efficiency", "fut_realized_vol", "duration"
+    ]].mean())
+
+    return res
+def identify_high_vol_state(blocks, feat_test, final_test, vol_col="vol_20"):
+    tmp = feat_test.copy()
+    tmp["state"] = final_test["state"]
+
+    state_vol = tmp.groupby("state")[vol_col].mean().sort_values()
+
+    high_vol_state = int(state_vol.index[-1])
+
+    print("\n=== State high vol spot ===")
+    print(state_vol)
+    print("High vol state =", high_vol_state)
+
+    return high_vol_state
+
+def forward_momentum_metrics(futures_price, start_date, horizon=5):
+    fut = futures_price.dropna()
+    logp = np.log(fut)
+    ret = logp.diff()
+
+    if start_date not in fut.index:
+        return None
+
+    i = fut.index.get_loc(start_date)
+
+    if i + horizon >= len(fut):
+        return None
+
+    start_price = logp.iloc[i]
+    end_price = logp.iloc[i + horizon]
+
+    fwd_ret = end_price - start_price
+
+    path_len = ret.iloc[i + 1:i + horizon + 1].abs().sum()
+
+    eff = abs(fwd_ret) / (path_len + 1e-8)
+
+    direction = np.sign(fwd_ret)
+
+    return {
+        "date": fut.index[i],
+        "fwd_ret": fwd_ret,
+        "abs_ret": abs(fwd_ret),
+        "efficiency": eff,
+        "direction": direction,
+    }
+
+def detect_first_futures_momentum_after_spot_block(
+    futures_price,
+    spot_block_start,
+    horizon=5,
+    max_lag=15,
+    eff_threshold=0.55,
+    min_abs_ret=0.01,
+):
+    results = []
+
+    fut = futures_price.dropna()
+
+    if spot_block_start not in fut.index:
+        return None, pd.DataFrame()
+
+    start_i = fut.index.get_loc(spot_block_start)
+
+    for lag in range(max_lag + 1):
+
+        if start_i + lag >= len(fut):
+            break
+
+        test_date = fut.index[start_i + lag]
+
+        m = forward_momentum_metrics(
+            futures_price=fut,
+            start_date=test_date,
+            horizon=horizon,
+        )
+
+        if m is None:
+            continue
+
+        m["lag"] = lag
+        results.append(m)
+
+        if (m["efficiency"] >= eff_threshold) and (m["abs_ret"] >= min_abs_ret):
+            return m, pd.DataFrame(results)
+
+    return None, pd.DataFrame(results)
+
+def extend_futures_momentum_segment(
+    futures_price,
+    momentum_start,
+    direction,
+    horizon=5,
+    exit_eff_threshold=0.35,
+    max_duration=40,
+):
+    fut = futures_price.dropna()
+    logp = np.log(fut)
+    ret = logp.diff()
+
+    if momentum_start not in fut.index:
+        return None
+
+    i0 = fut.index.get_loc(momentum_start)
+
+    last_good_i = i0
+
+    for i in range(i0 + horizon, min(i0 + max_duration, len(fut) - 1)):
+
+        r = logp.iloc[i] - logp.iloc[i - horizon]
+        path = ret.iloc[i - horizon + 1:i + 1].abs().sum()
+        eff = abs(r) / (path + 1e-8)
+
+        same_direction = np.sign(r) == direction
+
+        if eff >= exit_eff_threshold and same_direction:
+            last_good_i = i
+        else:
+            break
+
+    return {
+        "momentum_start": fut.index[i0],
+        "momentum_end": fut.index[last_good_i],
+        "duration": last_good_i - i0 + 1,
+    }
+
+def analyze_first_high_vol_spot_block_on_futures(
+    blocks,
+    futures_price,
+    high_vol_state,
+    horizon=5,
+    max_lag=15,
+    eff_threshold=0.55,
+    min_abs_ret=0.01,
+):
+    high_blocks = blocks[blocks["state"] == high_vol_state].copy()
+
+    if high_blocks.empty:
+        print("Aucun bloc high vol spot trouvé.")
+        return None
+
+    block = high_blocks.iloc[0]
+
+    print("\n=== Premier bloc high vol spot ===")
+    print(block)
+
+    bingo, scan = detect_first_futures_momentum_after_spot_block(
+        futures_price=futures_price,
+        spot_block_start=block["start"],
+        horizon=horizon,
+        max_lag=max_lag,
+        eff_threshold=eff_threshold,
+        min_abs_ret=min_abs_ret,
+    )
+
+    print("\n=== Scan futures après entrée high vol spot ===")
+    print(scan[["date", "lag", "fwd_ret", "abs_ret", "efficiency", "direction"]].round(4).to_string(index=False))
+
+    if bingo is None:
+        print("\nAucun momentum futures détecté après ce bloc.")
+        return {
+            "spot_block": block,
+            "bingo": None,
+            "scan": scan,
+            "segment": None,
+        }
+
+    print("\nBINGO momentum futures détecté :")
+    print(bingo)
+
+    segment = extend_futures_momentum_segment(
+        futures_price=futures_price,
+        momentum_start=bingo["date"],
+        direction=bingo["direction"],
+        horizon=horizon,
+        exit_eff_threshold=0.35,
+        max_duration=40,
+    )
+
+    print("\nSegment momentum futures :")
+    print(segment)
+
+    return {
+        "spot_block": block,
+        "bingo": bingo,
+        "scan": scan,
+        "segment": segment,
+    }
+
+def plot_first_block_futures_momentum(result, futures_price, padding=20):
+    if result is None:
+        return
+
+    block = result["spot_block"]
+    segment = result["segment"]
+
+    fut = futures_price.dropna()
+
+    start = block["start"]
+    end = block["end"]
+
+    if start not in fut.index:
+        return
+
+    i0 = fut.index.get_loc(start)
+
+    left_i = max(0, i0 - padding)
+    right_i = min(len(fut) - 1, i0 + 80)
+
+    plot_fut = fut.iloc[left_i:right_i + 1]
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+
+    ax.plot(plot_fut.index, plot_fut.values, color="black", lw=1.5, label="Futures")
+
+    ax.axvspan(
+        block["start"],
+        block["end"],
+        color="red",
+        alpha=0.15,
+        label="Spot high vol block",
+    )
+
+    ax.axvline(
+        block["start"],
+        color="red",
+        linestyle="--",
+        lw=1.5,
+        label="Spot high vol entry",
+    )
+
+    if segment is not None:
+        ax.axvspan(
+            segment["momentum_start"],
+            segment["momentum_end"],
+            color="blue",
+            alpha=0.20,
+            label="Detected futures momentum",
+        )
+
+        ax.axvline(
+            segment["momentum_start"],
+            color="blue",
+            linestyle="--",
+            lw=1.5,
+            label="Futures momentum start",
+        )
+
+    ax.set_title("First SPOT high-vol block → detected FUTURES momentum")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Futures price")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+def load_spot() -> pd.DataFrame:
+    df = pd.read_excel(SPOT_PATH, skiprows=1)
+    df.columns = df.columns.str.strip()
+
+    df["DATE"]  = pd.to_datetime(df["DATE"], errors="coerce")
+    df["BID"]   = pd.to_numeric(df["BID"], errors="coerce")
+    df["OFFER"] = pd.to_numeric(df["OFFER"], errors="coerce")
+
+    df["BID"]   = df["BID"].ffill(limit=3)
+    df["OFFER"] = df["OFFER"].ffill(limit=3)
+
+    df["MID"] = (df["BID"] + df["OFFER"]) / 2
+    df["BA_SPREAD"] = df["OFFER"] - df["BID"]
+
+    df = (
+        df[["DATE", "FUTURES", "BID", "OFFER", "MID", "BA_SPREAD"]]
+        .dropna(subset=["DATE", "MID", "BID", "OFFER", "FUTURES"])
+        .sort_values("DATE")
+        .rename(columns={"DATE": "Date"})
+        .groupby("Date", as_index=False)
+        .last()
+    )
+
+    return df
+
+
+def load_futures() -> pd.DataFrame:
+    df = pd.read_excel(FUTURES_PATH)
+    df.columns = df.columns.str.strip()
+    df["Date"]  = pd.to_datetime(df["Date"], errors="coerce")
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df = (df[["Date","Close"]]
+          .dropna()
+          .sort_values("Date")
+          .groupby("Date", as_index=False).last()
+          .rename(columns={"Close":"FUTURES_CLOSE"}))
+    df = df[df["FUTURES_CLOSE"] > 0].copy()
+    return df
+# ============================================================
+# ROBUST BLOCK-LEVEL VALIDATION
+# Spot HMM blocks projected on futures
+# Each futures block is classified using block-level metrics
+# ============================================================
+
+def classify_projected_futures_blocks(
+    blocks,
+    futures_price,
+    min_duration=5,
+):
+    fut = futures_price.dropna().copy()
+    logp = np.log(fut)
+    ret = logp.diff()
+
+    ref = build_reference_block_metrics(futures_price, window=20)
+
+    rows = []
+
+    for block_id, row in blocks.iterrows():
+
+        spot_state = int(row["state"])
+        start = row["start"]
+        end = row["end"]
+
+        sub = fut.loc[start:end].dropna()
+
+        if len(sub) < min_duration:
+            continue
+
+        p = np.log(sub)
+        r = p.diff().dropna()
+
+        if len(r) < 5:
+            continue
+
+        total_ret = p.iloc[-1] - p.iloc[0]
+        abs_ret = abs(total_ret)
+        direction = np.sign(total_ret)
+
+        path_len = r.abs().sum()
+        efficiency = abs_ret / (path_len + 1e-8)
+
+        realized_vol = r.std()
+        block_range = p.max() - p.min()
+
+        acf1 = r.autocorr(lag=1) if len(r) > 5 else np.nan
+        vr5 = variance_ratio(p, lag=5) if len(p) > 10 else np.nan
+
+        signs = np.sign(r.values)
+        signs = signs[signs != 0]
+
+        run_ratio = np.nan
+        sign_change_ratio = np.nan
+
+        if len(signs) > 1:
+            sign_change_ratio = np.mean(signs[1:] != signs[:-1])
+
+            max_run = 1
+            cur_run = 1
+
+            for j in range(1, len(signs)):
+                if signs[j] == signs[j - 1]:
+                    cur_run += 1
+                else:
+                    max_run = max(max_run, cur_run)
+                    cur_run = 1
+
+            max_run = max(max_run, cur_run)
+            run_ratio = max_run / len(signs)
+
+        # =========================
+        # Percentile ranks
+        # =========================
+
+        vol_rank = percentile_rank(realized_vol, ref["realized_vol"])
+        range_rank = percentile_rank(block_range, ref["block_range"])
+        absret_rank = percentile_rank(abs_ret, ref["abs_ret"])
+        eff_rank = percentile_rank(efficiency, ref["efficiency"])
+        run_rank = percentile_rank(run_ratio, ref["run_ratio"])
+        vr_rank = percentile_rank(vr5, ref["vr5"])
+        acf_rank = percentile_rank(acf1, ref["acf1"])
+        signchg_rank = percentile_rank(sign_change_ratio, ref["sign_change_ratio"])
+
+        # =========================
+        # Scores de régime
+        # =========================
+
+        stress_score = np.nanmean([
+            vol_rank,
+            range_rank,
+            absret_rank,
+            1 - eff_rank,
+        ])
+
+        trend_score = np.nanmean([
+            eff_rank,
+            range_rank,
+            absret_rank,
+            run_rank,
+        ])
+
+        momentum_score = np.nanmean([
+            eff_rank,
+            run_rank,
+            vr_rank,
+            acf_rank,
+        ])
+
+        mean_reversion_score = np.nanmean([
+            1 - eff_rank,
+            1 - vr_rank,
+            1 - acf_rank,
+            signchg_rank,
+        ])
+
+        calm_score = np.nanmean([
+            1 - vol_rank,
+            1 - range_rank,
+            1 - absret_rank,
+        ])
+
+        scores = {
+            "STRESS": stress_score,
+            "TREND": trend_score,
+            "MOMENTUM": momentum_score,
+            "MEAN_REVERSION": mean_reversion_score,
+            "CALM": calm_score,
+        }
+
+        fut_label = max(scores, key=scores.get)
+
+        sorted_scores = sorted(scores.values(), reverse=True)
+        label_confidence = sorted_scores[0] - sorted_scores[1]
+
+        rows.append({
+            "block_id": block_id,
+            "spot_state": spot_state,
+            "start": start,
+            "end": end,
+            "duration": len(sub),
+
+            "fut_label": fut_label,
+            "label_confidence": label_confidence,
+
+            "fut_ret": total_ret,
+            "fut_abs_ret": abs_ret,
+            "fut_direction": direction,
+            "fut_efficiency": efficiency,
+            "fut_realized_vol": realized_vol,
+            "fut_range": block_range,
+            "fut_acf1": acf1,
+            "fut_vr5": vr5,
+            "fut_run_ratio": run_ratio,
+            "fut_sign_change_ratio": sign_change_ratio,
+
+            "stress_score": stress_score,
+            "trend_score": trend_score,
+            "momentum_score": momentum_score,
+            "mean_reversion_score": mean_reversion_score,
+            "calm_score": calm_score,
+        })
+
+    res = pd.DataFrame(rows)
+
+    print("\n" + "=" * 80)
+    print("BLOCK-LEVEL FUTURES VALIDATION — ROBUST REGIME SCORES")
+    print("=" * 80)
+
+    if res.empty:
+        print("Aucun bloc futures valide.")
+        return res, pd.DataFrame()
+
+    cols = [
+        "spot_state",
+        "start",
+        "end",
+        "duration",
+        "fut_label",
+        "label_confidence",
+        "fut_ret",
+        "fut_efficiency",
+        "fut_realized_vol",
+        "fut_range",
+        "fut_acf1",
+        "fut_vr5",
+        "fut_run_ratio",
+        "fut_sign_change_ratio",
+        "stress_score",
+        "trend_score",
+        "momentum_score",
+        "mean_reversion_score",
+        "calm_score",
+    ]
+
+    print("\n=== Projected futures blocks ===")
+    print(res[cols].round(4).to_string(index=False))
+
+    counts = pd.crosstab(res["spot_state"], res["fut_label"])
+    freq = pd.crosstab(res["spot_state"], res["fut_label"], normalize="index")
+
+    print("\n=== Count futures labels by spot state ===")
+    print(counts)
+
+    print("\n=== Frequency futures labels by spot state ===")
+    print(freq.round(3))
+
+    print("\n=== Mean scores by spot state ===")
+    print(
+        res.groupby("spot_state")[
+            [
+                "stress_score",
+                "trend_score",
+                "momentum_score",
+                "mean_reversion_score",
+                "calm_score",
+                "label_confidence",
+            ]
+        ].mean().round(3)
+    )
+
+    return res, freq
+def plot_block_level_validation_matrix(freq):
+    plt.figure(figsize=(10, 5))
+
+    im = plt.imshow(freq.values, aspect="auto", vmin=0, vmax=1)
+
+    plt.xticks(
+        np.arange(len(freq.columns)),
+        freq.columns,
+        rotation=35,
+        ha="right"
+    )
+
+    plt.yticks(
+        np.arange(len(freq.index)),
+        [f"Spot State {s}" for s in freq.index]
+    )
+
+    for i in range(freq.shape[0]):
+        for j in range(freq.shape[1]):
+            plt.text(
+                j,
+                i,
+                f"{freq.values[i, j]:.1%}",
+                ha="center",
+                va="center",
+                color="black"
+            )
+
+    plt.title("Projected SPOT HMM blocks → FUTURES block behavior")
+    plt.xlabel("Futures block label")
+    plt.ylabel("Spot HMM state")
+    plt.colorbar(im, label="Block-level frequency")
+    plt.tight_layout()
+    plt.show()
+
+def plot_projected_blocks_on_futures(futures_price, block_df):
+    fut = futures_price.dropna()
+
+    colors = {
+    "STRESS": "red",
+    "TREND": "blue",
+    "MOMENTUM": "purple",
+    "MEAN_REVERSION": "orange",
+    "CALM": "green",
+}
+
+    fig, ax = plt.subplots(figsize=(16, 6))
+
+    ax.plot(
+        fut.index,
+        fut.values,
+        color="black",
+        lw=1.4,
+        label="Futures Close"
+    )
+
+    used = set()
+
+    for _, row in block_df.iterrows():
+        label = row["fut_label"]
+        color = colors.get(label, "gray")
+
+        legend_label = label if label not in used else None
+        used.add(label)
+
+        ax.axvspan(
+            row["start"],
+            row["end"],
+            color=color,
+            alpha=0.18,
+            label=legend_label
+        )
+
+        ax.text(
+            row["start"],
+            fut.loc[row["start"]:row["end"]].max(),
+            f"S{int(row['spot_state'])}\n{label}",
+            fontsize=8,
+            verticalalignment="top"
+        )
+
+    ax.set_title("Futures blocks induced by SPOT HMM regimes")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Futures Close")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def build_dataset(shift_spot: bool = True) -> pd.DataFrame:
+    spot = load_spot()
+    fut  = load_futures()
+    data = pd.merge(spot, fut, on="Date", how="inner")
+    data = data.sort_values("Date")
+
+    if shift_spot:
+        for c in ["BID","OFFER","MID","BA_SPREAD"]:
+            data[c] = data[c].shift(1)
+        data = data.dropna(subset=["MID","FUTURES_CLOSE"])
+
+    data = data[
+        (data["MID"] > 0) & (data["FUTURES_CLOSE"] > 0) & (data["BA_SPREAD"] >= 0)
+    ].set_index("Date")
+    return data
+
+
+# ============================================================
+# FEATURES
+# ============================================================
+def event_study_red_block_ends(
+    blocks,
+    data,
+    state_transition=1,
+    futures_col="FUTURES_CLOSE",
+    horizons=(5, 10, 20, 30),
+    n_perm=5000,
+    seed=42,
+):
+    rng = np.random.default_rng(seed)
+
+    fut = pd.to_numeric(data[futures_col], errors="coerce").dropna()
+
+    red_blocks = blocks[blocks["state"] == state_transition].copy()
+    event_dates = red_blocks["end"].tolist()
+
+    rows = []
+
+    for h in horizons:
+        event_rets = []
+
+        for d in event_dates:
+            if d not in fut.index:
+                continue
+
+            idx = fut.index.get_loc(d)
+
+            if idx + h >= len(fut):
+                continue
+
+            r = np.log(fut.iloc[idx + h] / fut.iloc[idx])
+            event_rets.append(r)
+
+        event_rets = np.array(event_rets)
+
+        valid_start = 0
+        valid_end = len(fut) - h - 1
+        all_idx = np.arange(valid_start, valid_end)
+
+        if len(event_rets) == 0:
+            continue
+
+        perm_means = []
+
+        for _ in range(n_perm):
+            sample_idx = rng.choice(all_idx, size=len(event_rets), replace=False)
+            sample_rets = np.log(
+                fut.iloc[sample_idx + h].values / fut.iloc[sample_idx].values
+            )
+            perm_means.append(sample_rets.mean())
+
+        perm_means = np.array(perm_means)
+
+        event_mean = event_rets.mean()
+        event_hit = (event_rets > 0).mean()
+
+        p_right = (perm_means >= event_mean).mean()
+        p_left = (perm_means <= event_mean).mean()
+        p_two_sided = 2 * min(p_right, p_left)
+
+        rows.append({
+            "horizon": h,
+            "n_events": len(event_rets),
+            "mean_event_ret_pct": 100 * event_mean,
+            "median_event_ret_pct": 100 * np.median(event_rets),
+            "hit_ratio_up": event_hit,
+            "random_mean_pct": 100 * perm_means.mean(),
+            "p_value_perm": p_two_sided,
+        })
+
+    res = pd.DataFrame(rows)
+
+    print("\n=== EVENT STUDY — FIN DES BLOCS ROUGES → FUTURES ===")
+    print(res.round(4).to_string(index=False))
+
+    return res
+
+from statsmodels.tsa.stattools import adfuller
+import numpy as np
+import pandas as pd
+
+
+def variance_ratio(x, lag=5):
+    x = pd.Series(x).dropna()
+    if len(x) < lag + 2:
+        return np.nan
+
+    r1 = x.diff().dropna()
+    rq = x.diff(lag).dropna()
+
+    v1 = r1.var()
+    vq = rq.var()
+
+    if v1 == 0:
+        return np.nan
+
+    return vq / (lag * v1)
+
+
+def hurst_exponent(ts):
+    ts = np.asarray(ts)
+
+    if len(ts) < 50:
+        return np.nan
+
+    lags = range(2, 20)
+
+    tau = [
+        np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag])))
+        for lag in lags
+    ]
+
+    poly = np.polyfit(np.log(lags), np.log(tau), 1)
+
+    return poly[0] * 2.0
+
+
+def ou_half_life(series):
+    s = pd.Series(series).dropna()
+
+    if len(s) < 20:
+        return np.nan
+
+    lagged = s.shift(1).dropna()
+    delta = s.diff().dropna()
+
+    lagged = lagged.loc[delta.index]
+
+    beta = np.polyfit(lagged, delta, 1)[0]
+
+    if beta >= 0:
+        return np.nan
+
+    return -np.log(2) / beta
+
+def add_contract_features(out, df):
+    month_map = {
+        "F": 1, "G": 2, "H": 3, "J": 4, "K": 5, "M": 6,
+        "N": 7, "Q": 8, "U": 9, "V": 10, "X": 11, "Z": 12
+    }
+
+    fut = df["FUTURES"].astype(str)
+
+    tmp = fut.str.extract(
+        r"ZC(?P<spot_month>[FGHJKMNQUVXZ])\s*(?P<future_month>[FGHJKMNQUVXZ])?(?P<yy>\d{2})"
+    )
+
+    contract_month_code = tmp["future_month"].fillna(tmp["spot_month"])
+    contract_month = contract_month_code.map(month_map)
+    contract_year = tmp["yy"].astype(float) + 2000
+
+    date = pd.to_datetime(df.index)
+
+    months_to_delivery = (
+        (contract_year.values - date.year) * 12
+        + (contract_month.values - date.month)
+    )
+
+    out["contract_season_sin"] = np.sin(2 * np.pi * contract_month / 12)
+    out["contract_season_cos"] = np.cos(2 * np.pi * contract_month / 12)
+    out["months_to_delivery"] = months_to_delivery
+
+    return out
+def build_features(
+    df: pd.DataFrame,
+    price_col: str = "MID",
+    spread_col: str = "BA_SPREAD",
+    eps: float = 1e-8,
+) -> pd.DataFrame:
+
+    out = pd.DataFrame(index=df.index)
+
+    price = pd.to_numeric(df[price_col], errors="coerce")
+    logp = np.log(price)
+    ret = logp.diff()
+
+    spread = pd.to_numeric(df[spread_col], errors="coerce")
+
+    # =========================
+    # 1) Momentum / direction
+    # =========================
+
+    out["ret_1"] = ret.shift(1)
+
+    out["ret_5"] = logp.shift(1) - logp.shift(6)
+    out["ret_20"] = logp.shift(1) - logp.shift(21)
+    out["ret_60"] = logp.shift(1) - logp.shift(61)
+
+    out["mom_20_vol_adj"] = (
+        out["ret_20"] / (ret.shift(1).rolling(60).std() + eps)
+    )
+
+    out["mom_60_vol_adj"] = (
+        out["ret_60"] / (ret.shift(1).rolling(120).std() + eps)
+    )
+
+    # =========================
+    # 2) Volatility regime
+    # =========================
+
+    vol_20 = ret.shift(1).rolling(20).std()
+    vol_60 = ret.shift(1).rolling(60).std()
+    vol_120 = ret.shift(1).rolling(120).std()
+    out["vol_20"] = vol_20
+    out["vol_60"] = vol_60
+
+    out["vol_ratio_20_120"] = vol_20 / (vol_120 + eps)
+
+    out["vol_z_20"] = (
+        (vol_20 - vol_20.rolling(120).mean())
+        / (vol_20.rolling(120).std() + eps)
+    )
+
+    out["abs_ret_z_20"] = (
+        (ret.shift(1).abs().rolling(20).mean()
+         - ret.shift(1).abs().rolling(120).mean())
+        / (ret.shift(1).abs().rolling(120).std() + eps)
+    )
+
+    # =========================
+    # 3) Market stress / liquidity
+    # =========================
+
+    spread_lag = spread.shift(1)
+
+    out["spread_z_60"] = (
+        (spread_lag - spread_lag.rolling(120).mean())
+        / (spread_lag.rolling(120).std() + eps)
+    )
+
+    out["spread_ratio_20_120"] = (
+        spread_lag.rolling(20).mean()
+        / (spread_lag.rolling(120).mean() + eps)
+    )
+
+    out["spread_vol_20"] = spread_lag.rolling(20).std()
+
+    out["stress_proxy"] = (
+        out["vol_ratio_20_120"] * out["spread_ratio_20_120"]
+    )
+
+    # =========================
+    # 4) Trend vs mean-reversion
+    # =========================
+
+    out["efficiency_20"] = (
+        abs(logp.shift(1) - logp.shift(21))
+        / (ret.shift(1).abs().rolling(20).sum() + eps)
+    )
+
+    out["efficiency_60"] = (
+        abs(logp.shift(1) - logp.shift(61))
+        / (ret.shift(1).abs().rolling(60).sum() + eps)
+    )
+
+    out["acf1_20"] = ret.shift(1).rolling(20).apply(
+        lambda x: pd.Series(x).autocorr(lag=1),
+        raw=False
+    )
+
+    out["acf5_60"] = ret.shift(1).rolling(60).apply(
+        lambda x: pd.Series(x).autocorr(lag=5),
+        raw=False
+    )
+
+    out["vr_5"] = ret.shift(1).rolling(60).apply(
+        lambda x: variance_ratio(x, lag=5),
+        raw=False
+    )
+
+    out["vr_20"] = ret.shift(1).rolling(120).apply(
+        lambda x: variance_ratio(x, lag=20),
+        raw=False
+    )
+
+    out["d_vr_5"] = out["vr_5"].diff()
+
+    # =========================
+    # 5) Position in local range
+    # =========================
+
+    roll_min = logp.shift(1).rolling(60).min()
+    roll_max = logp.shift(1).rolling(60).max()
+
+    out["range_pos_60"] = (
+        (logp.shift(1) - roll_min)
+        / (roll_max - roll_min + eps)
+    )
+
+    out["drawdown_60"] = (
+        logp.shift(1) - logp.shift(1).rolling(60).max()
+    )
+
+    # =========================
+    # 6) Optional latent structure
+    # =========================
+
+    out["hurst_100"] = logp.shift(1).rolling(100).apply(
+        hurst_exponent,
+        raw=False
+    )
+
+    out["half_life_60"] = logp.shift(1).rolling(60).apply(
+        ou_half_life,
+        raw=False
+    )
+    out["spread_vol_z_60"] = (
+    (out["spread_vol_20"] - out["spread_vol_20"].rolling(60).mean())
+    / (out["spread_vol_20"].rolling(60).std() + eps)
+)
+    out["vol_of_vol_20"] = vol_20.rolling(20).std()
+
+    out["vol_of_vol_z_60"] = (
+    (out["vol_of_vol_20"] - out["vol_of_vol_20"].rolling(60).mean())
+    / (out["vol_of_vol_20"].rolling(60).std() + eps)
+)
+    out["entropy_20"] = ret.shift(1).rolling(20).apply(
+    sign_entropy,
+    raw=False
+)
+    if "FUTURES" in df.columns:
+        out = add_contract_calendar_feature(out, df)
+
+    
+    
+    # =========================
+    # Clean
+    # =========================
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out = out.dropna()
+
+    return out
+def sign_entropy(x):
+    x = pd.Series(x).dropna()
+
+    if len(x) < 5:
+        return np.nan
+
+    signs = np.sign(x)
+
+    p_pos = (signs > 0).mean()
+    p_neg = (signs < 0).mean()
+    p_zero = (signs == 0).mean()
+
+    probs = np.array([p_pos, p_neg, p_zero])
+    probs = probs[probs > 0]
+
+    return -np.sum(probs * np.log(probs))
+# ============================================================
+# HMM
+# ============================================================
+
+def fit_hmm(X: np.ndarray, K: int):
+    if HMM_TYPE == "student":
+        cfg = StudentTHMMConfig(
+    K=K,
+    n_iter=150,
+    seed=SEED,
+    cov_type="diag",
+    min_var=1e-3,
+    sticky=3.0,
+    estimate_nu=False,
+    fixed_nu=6.0,
+)
+    else:
+        cfg = GaussianHMMConfig(K=K, n_iter=100, seed=SEED, cov_type="diag")
+    m = create_hmm(cfg)
+    r = m.fit(X)
+    return m, r
+
+
+def select_k(X: np.ndarray, k_range=(2, 3, 4)) -> pd.DataFrame:
+    """Choisir K par BIC sur les données d'entraînement."""
+    n, d = X.shape
+    rows = []
+    for k in k_range:
+        try:
+            m, r = fit_hmm(X, k)
+            ll = r.ll_hist[-1]
+            n_params = k * d + k * d + k * (k - 1) + (k - 1)
+            bic = -2 * ll + n_params * np.log(n)
+            aic = -2 * ll + 2 * n_params
+            rows.append({"K": k, "LL": ll, "BIC": bic, "AIC": aic})
+        except Exception as e:
+            print(f"  K={k} échec : {e}")
+    df = pd.DataFrame(rows)
+    print("\n=== Sélection K ===")
+    print(df.round(1).to_string(index=False))
+    if not df.empty:
+        print(f"  → K optimal (BIC) : {df.loc[df['BIC'].idxmin(),'K']}")
+    return df
+
+
+
+
+# ============================================================
+# PHASE 1 — VALIDATION
+# ============================================================
+
+def validate_regimes(
+    final_test: pd.DataFrame,      # colonnes: state, pmax, p0..pK-1
+    feat_test:  pd.DataFrame,
+    price_test: pd.Series,
+    selected_cols: list,
+    min_state_pct: float = 0.05,
+) -> dict:
+    """
+    5 tests. Retourne warnings (int) + conclusion (str).
+    Règle : ≥ 3 warnings → régimes non fiables.
+    """
+    df    = final_test.copy()
+    state = "state"
+    df[state] = df[state].astype(int)
+
+    print("\n" + "=" * 70)
+    print("PHASE 1 — VALIDATION DES RÉGIMES (TEST OOS)")
+    print("=" * 70)
+
+    warnings = 0
+
+    # ── Test 1 : occupation ──────────────────────────────────────────────
+    counts = df[state].value_counts().sort_index()
+    pct    = counts / len(df)
+    print(f"\n[1] Occupation des états")
+    print(pd.DataFrame({"n": counts, "pct": pct}).round(3).to_string())
+    rare = pct[pct < min_state_pct].index.tolist()
+    if rare:
+        print(f"  ⚠ États trop rares : {rare}")
+        warnings += 1
+    else:
+        print("  ✓ Tous les états ≥ 5 %")
+
+    # ── Test 2 : durée des blocs ─────────────────────────────────────────
+    tmp = df[[state]].copy()
+    tmp["block_id"] = (tmp[state] != tmp[state].shift()).cumsum()
+    blocks = tmp.groupby("block_id").agg(
+        state=(state, "first"), duration=(state, "size")
+    )
+    dur_med = blocks["duration"].median()
+    print(f"\n[2] Durée des blocs (médiane = {dur_med:.1f} j)")
+    print(blocks.groupby("state")["duration"].agg(["count","mean","median","min","max"]).round(1).to_string())
+    if dur_med <= 2:
+        print("  ⚠ Médiane ≤ 2 j — HMM trop bruité")
+        warnings += 1
+    else:
+        print("  ✓ Durées raisonnables")
+
+    # ── Test 3 : confiance pmax ──────────────────────────────────────────
+    if "pmax" in df.columns:
+        low = (df["pmax"] < 0.60).mean()
+        print(f"\n[3] Confiance pmax — pct < 0.60 : {low:.1%}")
+        print(df["pmax"].describe().round(3).to_string())
+        if low > 0.40:
+            print("  ⚠ Trop de points peu confiants")
+            warnings += 1
+        else:
+            print("  ✓ Probabilités confiantes")
+
+    # ── Test 4 : séparabilité des features (Kruskal-Wallis) ─────────────
+    aligned = feat_test.loc[df.index.intersection(feat_test.index)].copy()
+    aligned[state] = df.loc[aligned.index, state].values
+    rows = []
+    for col in selected_cols:
+        if col not in aligned.columns:
+            continue
+        groups = [
+            aligned.loc[aligned[state] == s, col].dropna().values
+            for s in sorted(aligned[state].unique())
+        ]
+        groups = [g for g in groups if len(g) > 2]
+        if len(groups) < 2:
+            continue
+        h, p = stats.kruskal(*groups)
+        rows.append({"feature": col, "H": h, "p": p, "sig": p < 0.05})
+    feat_df = pd.DataFrame(rows)
+    print(f"\n[4] Séparabilité des features (Kruskal-Wallis)")
+    print(feat_df.sort_values("p").round(4).to_string(index=False))
+    n_sig = feat_df["sig"].sum() if not feat_df.empty else 0
+    if n_sig <= max(1, len(feat_df) // 4):
+        print("  ⚠ Peu de features séparent réellement les régimes")
+        warnings += 1
+    else:
+        print(f"  ✓ {n_sig}/{len(feat_df)} features significatives")
+
+    # ── Test 5 : volatilité réalisée par état ───────────────────────────
+    ret    = np.log(price_test / price_test.shift(1))
+    vol5   = ret.rolling(5).std()
+    vol20  = ret.rolling(20).std()
+    check  = df.copy()
+    check["vol5"]  = vol5
+    check["vol20"] = vol20
+    vol_rows = []
+    for vc in ["vol5", "vol20"]:
+        x = check[[state, vc]].dropna()
+        groups = [x.loc[x[state] == s, vc].values for s in sorted(x[state].unique())]
+        groups = [g for g in groups if len(g) > 2]
+        if len(groups) < 2:
+            continue
+        h, p = stats.kruskal(*groups)
+        means = x.groupby(state)[vc].mean()
+        vol_rows.append({
+            "vol": vc, "H": h, "p": p,
+            "ratio max/min": means.max() / (means.min() + 1e-12),
+            "sig": p < 0.05,
+        })
+    vol_df = pd.DataFrame(vol_rows)
+    print(f"\n[5] Séparation volatilité réalisée")
+    print(vol_df.round(4).to_string(index=False))
+    if not vol_df.empty and not vol_df["sig"].any():
+        print("  ⚠ Aucune différence de vol significative entre états")
+        warnings += 1
+    else:
+        print("  ✓ Vol réalisée différente entre états")
+
+    # ── Synthèse ─────────────────────────────────────────────────────────
+    print("\n" + "-" * 70)
+    if warnings >= 3:
+        conclusion = f"❌ {warnings}/5 warnings — régimes non fiables (revoir K ou features)"
+    elif warnings == 2:
+        conclusion = f"⚠  {warnings}/5 warnings — régimes partiellement crédibles"
+    else:
+        conclusion = f"✓  {warnings}/5 warnings — régimes statistiquement défendables"
+    print("SYNTHÈSE :", conclusion)
+    print("-" * 70)
+
+    return {"warnings": warnings, "conclusion": conclusion, "blocks": blocks, "feat_sep": feat_df}
+
+
+# ============================================================
+# PHASE 2 — SEGMENTATION + PLOTS (seulement si Phase 1 OK)
+# ============================================================
+
+def enforce_min_block(states: np.ndarray, min_dur: int = 5) -> np.ndarray:
+    states = states.copy()
+    i = 0
+    while i < len(states):
+        j = i
+        while j < len(states) and states[j] == states[i]:
+            j += 1
+        if (j - i) < min_dur and i > 0:
+            states[i:j] = states[i - 1]
+        i = j
+    return states
+
+
+def segment(final_test: pd.DataFrame, probas: np.ndarray,
+            A: np.ndarray, enter_th=0.65, exit_th=0.50,
+            proj_horizon=10, min_block=5) -> pd.DataFrame:
+    """Segmentation online sans look-ahead + durée minimale."""
+    n, K = probas.shape
+    probas_s = pd.DataFrame(probas).ewm(span=3, adjust=False).mean().values
+
+    states = np.zeros(n, dtype=int)
+    cur = int(np.argmax(probas_s[0]))
+    states[0] = cur
+
+    for t in range(1, n):
+        p = probas_s[t]
+        prop = int(np.argmax(p))
+
+        if p[cur] >= exit_th:
+            states[t] = cur
+            continue
+
+        proj = p.copy()
+        stay = True
+        for _ in range(proj_horizon):
+            proj = proj @ A
+            if proj[cur] >= exit_th:
+                stay = False
+                break
+
+        if stay and p[prop] >= enter_th:
+            cur = prop
+        states[t] = cur
+
+    states = enforce_min_block(states, min_block)
+
+    seg = final_test.copy()
+    seg["state"]    = states
+    seg["block_id"] = (seg["state"] != seg["state"].shift()).cumsum()
+    seg["pmax"]     = probas_s.max(axis=1)
+    return seg
+
+
+def rebuild_blocks(seg: pd.DataFrame) -> pd.DataFrame:
+    return (
+        seg.groupby("block_id")
+        .agg(
+            state   =("state", "first"),
+            start   =("state", lambda x: x.index[0]),
+            end     =("state", lambda x: x.index[-1]),
+            duration=("state", "size"),
+            mean_pmax=("pmax", "mean"),
+        )
+        .reset_index(drop=True)
+    )
+
+
+def plot_price_with_regimes(price: pd.Series, blocks: pd.DataFrame, title: str):
+    colors = {0: "green", 1: "red", 2: "blue", 3: "orange"}
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(price.index, price.values, color="black", lw=1.2, alpha=0.7)
+    done = set()
+    for _, row in blocks.iterrows():
+        s = int(row["state"])
+        label = f"State {s}" if s not in done else None
+        done.add(s)
+        ax.axvspan(row["start"], row["end"], color=colors.get(s, "gray"), alpha=0.20, label=label)
+        if row["start"] in price.index:
+            ax.scatter(row["start"], price.loc[row["start"]],
+                       s=60, color=colors.get(s, "black"), edgecolors="black", zorder=5)
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    
+
+
+def plot_regime_duration(states: np.ndarray):
+    durations, cur, cnt = [], states[0], 1
+    for s in states[1:]:
+        if s == cur:
+            cnt += 1
+        else:
+            durations.append(cnt)
+            cur, cnt = s, 1
+    durations.append(cnt)
+    plt.figure(figsize=(8, 4))
+    plt.hist(durations, bins=20, color="steelblue", edgecolor="white")
+    plt.title("Distribution des durées de régime")
+    plt.xlabel("Jours")
+    plt.ylabel("Fréquence")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_proba_stack(final_test: pd.DataFrame, K: int, title="Probabilités HMM"):
+    colors = ["green", "red", "blue", "orange"]
+    fig, ax = plt.subplots(figsize=(14, 4))
+    bottom = np.zeros(len(final_test))
+    for k in range(K):
+        col = f"p{k}"
+        if col in final_test.columns:
+            ax.fill_between(final_test.index, bottom, bottom + final_test[col].values,
+                            color=colors[k % len(colors)], alpha=0.6, label=f"State {k}")
+            bottom += final_test[col].values
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Probabilité")
+    ax.legend(loc="upper left")
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def classify_red_block(row, spot, lookback=20):
+    start = row["start"]
+    end = row["end"]
+
+    i0 = spot.index.get_loc(start)
+    i1 = spot.index.get_loc(end)
+
+    pre_start = max(0, i0 - lookback)
+
+    pre_ret = np.log(spot.iloc[i0] / spot.iloc[pre_start])
+    block_ret = np.log(spot.iloc[i1] / spot.iloc[i0])
+
+    if pre_ret > 0.05 and block_ret > 0:
+        return "momentum_up"
+
+    elif pre_ret < -0.05 and block_ret < 0:
+        return "crisis_down"
+
+    elif pre_ret < -0.05 and block_ret > 0:
+        return "mean_revert_up"
+
+    elif pre_ret > 0.05 and block_ret < 0:
+        return "top_reversal"
+
+    else:
+        return "transition_neutral"
+
+
+def plot_spot_and_futures_same_regimes(
+    spot_price,
+    futures_price,
+    blocks,
+    title="Spot + Futures with same HMM regimes",
+):
+
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(15, 6))
+
+    # ======================================================
+    # Régimes HMM (du spot)
+    # ======================================================
+
+    colors = {
+        0: "green",
+        1: "red",
+        2: "blue",
+        3: "orange",
+    }
+
+    for _, row in blocks.iterrows():
+
+        s = int(row["state"])
+
+        ax.axvspan(
+            row["start"],
+            row["end"],
+            color=colors.get(s, "gray"),
+            alpha=0.18,
+        )
+
+    # ======================================================
+    # Courbe SPOT
+    # ======================================================
+
+    ax.plot(
+        spot_price.index,
+        spot_price.values,
+        color="black",
+        linewidth=2,
+        label="Spot MID",
+    )
+
+    # ======================================================
+    # Courbe FUTURES
+    # ======================================================
+
+    ax.plot(
+        futures_price.index,
+        futures_price.values,
+        color="blue",
+        linewidth=2,
+        alpha=0.7,
+        label="Futures Close",
+    )
+
+    ax.set_title(title)
+
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+
+    ax.legend()
+
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+def event_study_spot_regime_to_futures_structure(
+    blocks,
+    futures_price,
+    horizons=(5, 10, 20, 30),
+    eff_window=20,
+):
+    """
+    Teste ce que deviennent les futures après le début de chaque bloc HMM spot.
+    Mesure:
+      - futures return forward
+      - futures absolute return forward
+      - futures efficiency forward
+    """
+
+    fut = futures_price.dropna().copy()
+    logp = np.log(fut)
+    ret = logp.diff()
+    eps = 1e-8
+
+    rows = []
+
+    for _, row in blocks.iterrows():
+        state = int(row["state"])
+        start = row["start"]
+        end = row["end"]
+
+        if start not in fut.index:
+            continue
+
+        i = fut.index.get_loc(start)
+
+        for h in horizons:
+            if i + h >= len(fut):
+                continue
+
+            r_fwd = logp.iloc[i + h] - logp.iloc[i]
+            abs_r_fwd = abs(r_fwd)
+
+            path_len = ret.abs().iloc[i + 1:i + h + 1].sum()
+            eff_fwd = abs_r_fwd / (path_len + eps)
+
+            rows.append({
+                "spot_state_entered": state,
+                "event_date": start,
+                "horizon": h,
+                "futures_ret_fwd": r_fwd,
+                "futures_abs_ret_fwd": abs_r_fwd,
+                "futures_eff_fwd": eff_fwd,
+                "block_duration": row["duration"],
+            })
+
+    res = pd.DataFrame(rows)
+
+    print("\n=== EVENT STUDY — Entrée régime SPOT → structure FUTURES ===")
+
+    summary = (
+        res.groupby(["spot_state_entered", "horizon"])
+        .agg(
+            n=("futures_ret_fwd", "count"),
+            mean_ret=("futures_ret_fwd", "mean"),
+            median_ret=("futures_ret_fwd", "median"),
+            mean_abs_ret=("futures_abs_ret_fwd", "mean"),
+            mean_eff=("futures_eff_fwd", "mean"),
+            median_eff=("futures_eff_fwd", "median"),
+        )
+        .reset_index()
+    )
+
+    print(summary.round(4).to_string(index=False))
+
+    return res, summary
+def plot_event_futures_efficiency_by_spot_state(event_df):
+    plt.figure(figsize=(9, 5))
+
+    states = sorted(event_df["spot_state_entered"].unique())
+    horizons = sorted(event_df["horizon"].unique())
+
+    for s in states:
+        sub = (
+            event_df[event_df["spot_state_entered"] == s]
+            .groupby("horizon")["futures_eff_fwd"]
+            .mean()
+            .reindex(horizons)
+        )
+
+        plt.plot(
+            horizons,
+            sub.values,
+            marker="o",
+            label=f"Spot entered State {s}"
+        )
+
+    plt.title("Futures forward efficiency after SPOT regime entry")
+    plt.xlabel("Horizon")
+    plt.ylabel("Futures forward efficiency")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_forward_return_distribution(
+    blocks,
+    futures_price,
+    state=1,
+    horizon=20,
+):
+    fut = futures_price.dropna()
+    logp = np.log(fut)
+
+    rets = []
+
+    for _, row in blocks.iterrows():
+        if row["state"] != state:
+            continue
+
+        d = row["start"]
+
+        if d not in fut.index:
+            continue
+
+        i = fut.index.get_loc(d)
+
+        if i + horizon >= len(fut):
+            continue
+
+        r = 100 * (logp.iloc[i + horizon] - logp.iloc[i])
+        rets.append(r)
+
+    rets = np.array(rets)
+
+    plt.figure(figsize=(9, 5))
+    plt.hist(rets, bins=15, alpha=0.7, edgecolor="black")
+
+    plt.axvline(0, color="red", linestyle="--")
+
+    plt.title(f"Futures {horizon}d forward returns after SPOT stress regime")
+    plt.xlabel("Forward return (%)")
+    plt.ylabel("Count")
+
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    print("\nMean:", rets.mean())
+    print("Median:", np.median(rets))
+    print("Hit ratio < 0:", (rets < 0).mean())
+    print("Hit ratio > 0:", (rets > 0).mean())
+
+def plot_forward_return_distribution(
+    blocks,
+    futures_price,
+    state=1,
+    horizon=20,
+    min_duration=5,
+):
+    fut = futures_price.dropna()
+    logp = np.log(fut)
+
+    rets = []
+
+    for _, row in blocks.iterrows():
+
+        if row["state"] != state:
+            continue
+
+        if row["duration"] < min_duration:
+            continue
+
+        d = row["start"]
+
+        if d not in fut.index:
+            continue
+
+        i = fut.index.get_loc(d)
+
+        if i + horizon >= len(fut):
+            continue
+
+        r = 100 * (logp.iloc[i + horizon] - logp.iloc[i])
+
+        rets.append(r)
+
+    rets = np.array(rets)
+
+    if len(rets) == 0:
+        print("Aucun événement valide.")
+        return
+
+    plt.figure(figsize=(9, 5))
+
+    plt.hist(
+        rets,
+        bins=max(5, min(15, len(rets))),
+        alpha=0.7,
+        edgecolor="black",
+    )
+
+    plt.axvline(0, color="red", linestyle="--")
+
+    plt.title(
+        f"Futures {horizon}d forward returns\n"
+        f"after SPOT stress regime entry"
+    )
+
+    plt.xlabel("Forward return (%)")
+    plt.ylabel("Count")
+
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    print("\n=== Forward returns after SPOT stress regime ===")
+    print(f"N events       : {len(rets)}")
+    print(f"Mean return    : {rets.mean():.2f}%")
+    print(f"Median return  : {np.median(rets):.2f}%")
+    print(f"Std            : {rets.std():.2f}%")
+    print(f"P(return < 0)  : {(rets < 0).mean():.2%}")
+    print(f"P(return > 0)  : {(rets > 0).mean():.2%}")
+
+def map_states_by_behavior(states_raw, alpha_raw, feat, selected_cols):
+    tmp = feat[selected_cols].copy()
+    tmp["state_raw"] = states_raw
+
+    means = tmp.groupby("state_raw")[selected_cols].mean()
+
+    means["stress_score"] = (
+        means.get("vol_z_20", 0)
+        + means.get("vol_ratio_20_120", 0)
+        + means.get("abs_ret_z_20", 0)
+        + means.get("spread_z_60", 0)
+        + means.get("spread_ratio_20_120", 0)
+        + means.get("spread_vol_z_60", 0)
+        + means.get("stress_proxy", 0)
+        + means.get("vol_of_vol_z_60", 0)
+    )
+
+    means["sideways_score"] = (
+        means.get("entropy_20", 0)
+        - means.get("efficiency_20", 0)
+        - means.get("vr_5", 0)
+        - means.get("vol_z_20", 0)
+        - means.get("abs_ret_z_20", 0)
+    )
+
+    means["organized_score"] = (
+        means.get("efficiency_20", 0)
+        + means.get("vr_5", 0)
+        - means.get("entropy_20", 0)
+        - means.get("vol_of_vol_z_60", 0)
+    )
+
+    raw_states = list(means.index)
+
+    stress_raw = means["stress_score"].idxmax()
+
+    candidates = [s for s in raw_states if s != stress_raw]
+
+    if len(candidates) == 0:
+        raise ValueError("Impossible de mapper les états : un seul état brut détecté.")
+
+    sideways_raw = means.loc[candidates, "sideways_score"].idxmax()
+
+    candidates2 = [s for s in raw_states if s not in [stress_raw, sideways_raw]]
+
+    if len(candidates2) > 0:
+        organized_raw = means.loc[candidates2, "organized_score"].idxmax()
+    else:
+        # fallback : si K=2 ou collision inattendue
+        organized_raw = means["organized_score"].idxmax()
+        if organized_raw in [stress_raw, sideways_raw]:
+            organized_raw = candidates[0]
+
+    mapping = {
+        sideways_raw: 0,      # sideways / compression
+        stress_raw: 1,        # stress / dislocation
+        organized_raw: 2,     # organized / persistent
+    }
+
+    # Si collision dans le mapping, assigner les états restants proprement
+    used_old = set(mapping.keys())
+    unused_old = [s for s in raw_states if s not in used_old]
+    used_new = set(mapping.values())
+    unused_new = [s for s in range(len(raw_states)) if s not in used_new]
+
+    for old, new in zip(unused_old, unused_new):
+        mapping[old] = new
+
+    states_new = np.array([mapping[s] for s in states_raw], dtype=int)
+
+    alpha_new = np.zeros_like(alpha_raw)
+    for old, new in mapping.items():
+        if old < alpha_raw.shape[1] and new < alpha_raw.shape[1]:
+            alpha_new[:, new] = alpha_raw[:, old]
+
+    print("\n=== Mapping latent MARKET regimes ===")
+    print(means.round(4))
+    print("mapping old -> new:", mapping)
+    print("0 = sideways / compression")
+    print("1 = stress / dislocation")
+    print("2 = organized / persistent")
+
+    return states_new, alpha_new, mapping
+def apply_mapping(states_raw, alpha_raw, mapping):
+    K_raw = alpha_raw.shape[1]
+
+    # garder seulement les mappings valides
+    valid_mapping = {
+        old: new
+        for old, new in mapping.items()
+        if old < K_raw and new < K_raw
+    }
+
+    # si un état raw manque, on le mappe vers lui-même si possible
+    for old in range(K_raw):
+        if old not in valid_mapping:
+            valid_mapping[old] = old
+
+    states_new = np.array(
+        [valid_mapping.get(int(s), int(s)) for s in states_raw],
+        dtype=int
+    )
+
+    alpha_new = np.zeros_like(alpha_raw)
+
+    for old, new in valid_mapping.items():
+        alpha_new[:, new] = alpha_raw[:, old]
+
+    return states_new, alpha_new
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("=" * 70)
+    print("HMM REGIME ANALYSIS — PHASE 1 : VALIDATION → PHASE 2 : PLOTS")
+    print("=" * 70)
+
+    data = build_dataset(shift_spot=True)
+    n = len(data)
+    n_tr = int(n * TRAIN_RATIO)
+
+    data_train = data.iloc[:n_tr]
+    data_test = data.iloc[n_tr:]
+    print(f"Train : {len(data_train)} obs  |  Test : {len(data_test)} obs")
+
+    feat_train = build_features(data_train)
+    feat_all = build_features(pd.concat([data_train, data_test]))
+    feat_test = feat_all.loc[feat_all.index.isin(data_test.index)].copy()
+
+    common_cols = [c for c in SELECTED_COLS if c in feat_train.columns and c in feat_test.columns]
+    if len(common_cols) != len(SELECTED_COLS):
+        missing = set(SELECTED_COLS) - set(common_cols)
+        raise ValueError(f"Colonnes features manquantes : {missing}")
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(feat_train[common_cols].values)
+    X_test = scaler.transform(feat_test[common_cols].values)
+
+    X_train = np.clip(X_train, -CLIP, CLIP)
+    X_test = np.clip(X_test, -CLIP, CLIP)
+
+    if not np.all(np.isfinite(X_train)):
+        raise ValueError("X_train contient nan/inf")
+    if not np.all(np.isfinite(X_test)):
+        raise ValueError("X_test contient nan/inf")
+
+    select_k(X_train, k_range=(2, 3, 4))
+
+    model, result = fit_hmm(X_train, NB_STATES)
+
+    train_states_raw, train_alpha_raw, train_ll = model.filter(X_train)
+
+    pi_test = train_alpha_raw[-1] @ model.A
+    test_states_raw, test_alpha_raw, test_ll = model.filter_with_pi(X_test, pi_test)
+
+    # Mapping robuste par volatilité du modèle
+    train_states, train_alpha, mapping = map_states_by_behavior(
+    train_states_raw,
+    train_alpha_raw,
+    feat_train.loc[feat_train.index[:len(train_states_raw)]],
+    common_cols,
+)
+
+    
+
+    train_states, train_alpha, mapping = map_states_by_behavior(
+    train_states_raw,
+    train_alpha_raw,
+    feat_train.loc[feat_train.index[:len(train_states_raw)]],
+    common_cols,
+)
+
+    test_states, test_alpha = apply_mapping(
+        test_states_raw,
+        test_alpha_raw,
+        mapping,
+    )
+
+    order = [old for old, new in sorted(mapping.items(), key=lambda x: x[1])]
+    A_reordered = model.A[np.ix_(order, order)]
+    print("Train states:", np.unique(train_states, return_counts=True))
+    print("Matrice transition A réordonnée:\n", A_reordered)
+    print("Moyennes par état brut:\n", model.means)
+    print("LL train:", train_ll, "| LL test:", test_ll)
+
+    final_test = pd.DataFrame(index=feat_test.index)
+    final_test["state"] = test_states
+    final_test["pmax"] = np.max(test_alpha, axis=1)
+
+    for k in range(test_alpha.shape[1]):
+        final_test[f"p{k}"] = test_alpha[:, k]
+
+    price_test = data.loc[final_test.index, "MID"]
+
+    print("\n=== Features train ===")
+    print(feat_train[common_cols].describe())
+    print("\n=== Features test ===")
+    print(feat_test[common_cols].describe())
+    print("\n=== MID test ===")
+    print(data.loc[data_test.index, "MID"].describe())
+    print(data.loc[data_test.index, "MID"].head(20))
+
+    val = validate_regimes(
+        final_test=final_test,
+        feat_test=feat_test,
+        price_test=price_test,
+        selected_cols=common_cols,
+    )
+
+    if val["warnings"] >= 3:
+        print("\nPhase 1 échouée — arrêt.")
+        print("→ Essayer un autre K, d'autres features, ou vérifier les données.")
+        return
+
+    print("\nPhase 1 OK — passage à la segmentation et aux plots.\n")
+
+    probas = final_test[[f"p{k}" for k in range(NB_STATES)]].values
+
+    seg = segment(
+        final_test=final_test,
+        probas=probas,
+        A=A_reordered,
+        enter_th=0.65,
+        exit_th=0.50,
+        proj_horizon=10,
+        min_block=5,
+    )
+
+    blocks = rebuild_blocks(seg)
+
+    print("=== Blocs finaux ===")
+    print(blocks[["state", "start", "end", "duration", "mean_pmax"]].to_string(index=False))
+
+    spot_price = data.loc[final_test.index, "MID"]
+
+    plot_price_with_regimes(
+        price=spot_price,
+        blocks=blocks,
+        title=f"Spot MID — régimes HMM ({NB_STATES} états)",
+    )
+
+    plot_regime_duration(seg["state"].values)
+
+    red_blocks = blocks[blocks["state"] == 1].copy()
+    if not red_blocks.empty:
+        red_blocks["type"] = red_blocks.apply(
+            lambda row: classify_red_block(row, spot_price, lookback=20),
+            axis=1,
+        )
+
+        for t in red_blocks["type"].unique():
+            sub = red_blocks[red_blocks["type"] == t]
+            print("\nTYPE:", t)
+            print(sub[["start", "end", "duration"]])
+
+    raw_futures = load_futures().set_index("Date")["FUTURES_CLOSE"]
+
+    raw_futures_plot = raw_futures.loc[
+        blocks["start"].min(): blocks["end"].max()
+    ]
+
+    plot_price_with_regimes(
+        price=raw_futures_plot,
+        blocks=blocks,
+        title=f"Futures Close brut — mêmes régimes HMM spot ({NB_STATES} états)",
+    )
+
+    fut = load_futures()
+    mask = (fut["Date"] >= "2025-10-01") & (fut["Date"] <= "2026-01-31")
+    sub = fut[mask]
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(sub["Date"], sub["FUTURES_CLOSE"], color="blue", lw=1.5)
+    plt.title("Futures Close — Oct 2025 à Jan 2026")
+    plt.xlabel("Date")
+    plt.ylabel("Price")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    price = raw_futures_plot
+    h = 10
+
+    tmp = pd.DataFrame(index=seg.index)
+    tmp["state"] = seg["state"]
+    tmp["ret_fwd"] = np.log(price.shift(-h) / price)
+    tmp["ret_now"] = np.log(price / price.shift(20))
+    tmp = tmp.dropna()
+
+    print("\n=== Futures returns par régime ===")
+    print(tmp.groupby("state")[["ret_now", "ret_fwd"]].agg(
+        ["mean", "median", "std", "count"]
+    ))
+
+    tmp_eff = pd.DataFrame(index=feat_test.index)
+    tmp_eff["state"] = final_test["state"]
+    tmp_eff["eff"] = feat_test["efficiency_20"]
+
+    print("\n=== Efficiency par régime ===")
+    print(tmp_eff.groupby("state")["eff"].describe())
+
+    event_df, event_summary = event_study_spot_regime_to_futures_structure(
+        blocks=blocks,
+        futures_price=raw_futures_plot,
+        horizons=(5, 10, 20, 30),
+        eff_window=20,
+    )
+
+    plot_event_futures_efficiency_by_spot_state(event_df)
+
+    impulse_state = 1
+
+    first_result = analyze_first_high_vol_spot_block_on_futures(
+    blocks=blocks,
+    futures_price=raw_futures_plot,
+    high_vol_state=impulse_state,
+    horizon=5,
+    max_lag=15,
+    eff_threshold=0.55,
+    min_abs_ret=0.01,
+)
+    plot_first_block_futures_momentum(
+        result=first_result,
+        futures_price=raw_futures_plot,
+        padding=20,
+    )
+    fut_structure = futures_structure_by_spot_regime(
+    blocks=blocks,
+    futures_price=raw_futures_plot,
+)
+    plot_forward_return_distribution(
+    blocks=blocks,
+    futures_price=raw_futures_plot,
+    state=1,
+    horizon=20,
+    min_duration=5,
+)
+    raw_futures = load_futures().set_index("Date")["FUTURES_CLOSE"]
+
+    raw_futures_plot = raw_futures.loc[
+        blocks["start"].min():blocks["end"].max()
+    ]
+
+    block_df, block_freq = classify_projected_futures_blocks(
+        blocks=blocks,
+        futures_price=raw_futures_plot,
+        min_duration=5,
+    )
+
+    plot_block_level_validation_matrix(block_freq)
+
+    plot_projected_blocks_on_futures(
+        futures_price=raw_futures_plot,
+        block_df=block_df,
+    )
+    tmp = feat_train[common_cols].copy()
+    tmp["state"] = train_states
+
+    print(tmp.groupby("state")[common_cols].mean().round(3))
+    print(tmp.groupby("state")["days_to_contract_month"].describe().round(2))
+if __name__ == "__main__":
+    main()

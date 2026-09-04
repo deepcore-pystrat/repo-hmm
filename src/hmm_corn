@@ -1,0 +1,1090 @@
+# ============================================================
+# SPOT HMM → LATENT MARKET STATE FEED
+# + FUTURES CONDITIONAL DYNAMICS VALIDATION
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+
+from models import StudentTHMMConfig, GaussianHMMConfig, create_hmm
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+SPOT_PATH = r"D:\Downloads\deepcore--2026-04-07-12_42-0026205d-213a-4e96-bbe9-a7c977a1c3d4.xlsx"
+FUTURES_PATH = r"D:\Downloads\data_futures_corn.xlsx"
+
+NB_STATES = 2
+HMM_TYPE = "student"          # "student" or "gaussian"
+TRAIN_RATIO = 0.75
+SEED = 42
+CLIP = 3.5
+HORIZON = 10
+
+SELECTED_COLS = [
+    "vol_20",
+    "ret_20",
+    "ret_60",
+    "vol_skew_diff_20",
+    "illiq_proxy_20",
+    "ret_kurt_20",
+]
+# ============================================================
+# DATA
+# ============================================================
+def extract_blocks_from_feed(state_feed, min_len=5):
+    df = state_feed.copy()
+    df["block_id"] = (df["spot_state"] != df["spot_state"].shift()).cumsum()
+
+    rows = []
+
+    for block_id, g in df.groupby("block_id"):
+        if len(g) < min_len:
+            continue
+
+        rows.append({
+            "block_id": int(block_id),
+            "state": int(g["spot_state"].iloc[0]),
+            "start": g.index[0],
+            "end": g.index[-1],
+            "length": len(g),
+            "confidence_mean": g["spot_state_confidence"].mean(),
+        })
+
+    return pd.DataFrame(rows)
+
+def compute_future_block_metrics(blocks, data, eps=1e-8):
+    rows = []
+
+    log_fut = np.log(data["FUTURES_CLOSE"].astype(float))
+
+    for _, b in blocks.iterrows():
+        start = b["start"]
+        end = b["end"]
+
+        p = log_fut.loc[start:end].dropna()
+
+        if len(p) < 5:
+            continue
+
+        r = p.diff().dropna()
+
+        if len(r) < 3:
+            continue
+
+        total_ret = p.iloc[-1] - p.iloc[0]
+        path_len = r.abs().sum()
+
+        signs = np.sign(r.values)
+        signs = signs[signs != 0]
+
+        signchg = (
+            np.mean(signs[1:] != signs[:-1])
+            if len(signs) > 1
+            else np.nan
+        )
+
+        rows.append({
+            "block_id": b["block_id"],
+            "state": b["state"],
+            "start": b["start"],
+            "end": b["end"],
+            "length": b["length"],
+            "confidence_mean": b["confidence_mean"],
+
+            "fut_return": total_ret,
+            "fut_abs_return": abs(total_ret),
+            "fut_path": path_len,
+            "fut_efficiency": abs(total_ret) / (path_len + eps),
+            "fut_rv": np.sum(r ** 2),
+            "fut_vol": r.std(),
+            "fut_signchg": signchg,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def score_and_label_blocks(block_metrics, feat, eps=1e-8, min_margin=0.20):
+    df = block_metrics.copy()
+
+    rel_spreads = []
+
+    for _, b in df.iterrows():
+        start = b["start"]
+        end   = b["end"]
+        illiq_block = feat.loc[start:end, "illiq_proxy_20"].median()
+        rel_spreads.append(illiq_block)
+
+    df["illiq_proxy_20_block"] = rel_spreads
+
+    raw = pd.DataFrame(index=df.index)
+
+    raw["Persistence"] = df["fut_efficiency"]
+    raw["Reversal"]    = df["fut_signchg"]
+    raw["Vol"]         = df["fut_vol"]
+    raw["RV"]          = df["fut_rv"]
+    raw["Spread"]      = df["illiq_proxy_20_block"]
+
+    center = raw.median()
+    scale  = raw.apply(lambda x: np.median(np.abs(x - x.median()))) + eps
+    z      = (raw - center) / scale
+
+    df["score_momentum"] = (
+        + 1.00 * z["Persistence"]
+        - 0.50 * z["Reversal"]
+        - 0.25 * z["Vol"]
+        - 0.25 * z["Spread"]
+    )
+
+    df["score_stress"] = (
+        + 0.60 * z["Vol"]
+        + 0.60 * z["RV"]
+        + 0.50 * z["Spread"]
+        - 0.20 * z["Persistence"]
+    )
+
+    df["score_mean_reverting"] = (
+        + 1.00 * z["Reversal"]
+        - 0.70 * z["Persistence"]
+        - 0.20 * z["Vol"]
+        - 0.20 * z["Spread"]
+    )
+
+    df["score_sideways_low_vol"] = (
+        - 0.60 * z["Vol"]
+        - 0.60 * z["RV"]
+        - 0.40 * z["Persistence"]
+        - 0.20 * z["Spread"]
+    )
+
+    df["score_volatile_choppy"] = (
+        + 0.60 * z["Vol"]
+        + 0.60 * z["Reversal"]
+        - 0.50 * z["Persistence"]
+    )
+
+    score_cols = [
+        "score_momentum",
+        "score_stress",
+        "score_mean_reverting",
+        "score_sideways_low_vol",
+        "score_volatile_choppy",
+    ]
+
+    label_map = {
+        "score_momentum":        "momentum",
+        "score_stress":          "stress",
+        "score_mean_reverting":  "mean_reverting",
+        "score_sideways_low_vol":"sideways_low_vol",
+        "score_volatile_choppy": "volatile_choppy",
+    }
+
+    scores = df[score_cols]
+
+    df["best_score_name"] = scores.idxmax(axis=1)
+    df["best_score"]      = scores.max(axis=1)
+
+    sorted_scores       = np.sort(scores.values, axis=1)
+    df["score_margin"]  = sorted_scores[:, -1] - sorted_scores[:, -2]
+
+    df["block_label"] = df["best_score_name"].map(label_map)
+
+    df.loc[df["score_margin"] < min_margin, "block_label"] = "mixed_unclear"
+
+    df["block_label_confidence"] = df["score_margin"]
+
+    return df
+
+def load_spot():
+    df = pd.read_excel(SPOT_PATH, skiprows=1)
+    df.columns = df.columns.str.strip()
+
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df["BID"] = pd.to_numeric(df["BID"], errors="coerce")
+    df["OFFER"] = pd.to_numeric(df["OFFER"], errors="coerce")
+
+    df["BID"] = df["BID"].ffill(limit=3)
+    df["OFFER"] = df["OFFER"].ffill(limit=3)
+
+    df["MID"] = (df["BID"] + df["OFFER"]) / 2.0
+    df["BA_SPREAD"] = df["OFFER"] - df["BID"]
+
+    df = (
+        df[["DATE", "FUTURES", "BID", "OFFER", "MID", "BA_SPREAD"]]
+        .dropna(subset=["DATE", "FUTURES", "MID", "BID", "OFFER"])
+        .sort_values("DATE")
+        .rename(columns={"DATE": "Date"})
+        .groupby("Date", as_index=False)
+        .last()
+    )
+
+    return df
+
+
+def load_futures():
+    df = pd.read_excel(FUTURES_PATH)
+    df.columns = df.columns.str.strip()
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+    df = (
+        df[["Date", "Close","Volume"]]
+        .dropna()
+        .sort_values("Date")
+        .groupby("Date", as_index=False)
+        .last()
+        .rename(columns={"Close": "FUTURES_CLOSE"})
+    )
+
+    df = df[df["FUTURES_CLOSE"] > 0].copy()
+    return df
+
+
+def build_dataset(shift_spot=True):
+    spot = load_spot()
+    fut = load_futures()
+
+    data = pd.merge(spot, fut, on="Date", how="inner")
+    data = data.sort_values("Date")
+
+    if shift_spot:
+        for c in ["BID", "OFFER", "MID", "BA_SPREAD"]:
+            data[c] = data[c].shift(1)
+
+    data = data.dropna(subset=["MID", "FUTURES_CLOSE"])
+    data = data[
+        (data["MID"] > 0) &
+        (data["FUTURES_CLOSE"] > 0) &
+        (data["BA_SPREAD"] >= 0)
+    ]
+
+    return data.set_index("Date")
+
+
+# ============================================================
+# FEATURES
+# ============================================================
+
+def variance_ratio(x, lag=5):
+    x = pd.Series(x).dropna()
+
+    if len(x) < lag + 2:
+        return np.nan
+
+    r1 = x.diff().dropna()
+    rq = x.diff(lag).dropna()
+
+    v1 = r1.var()
+    vq = rq.var()
+
+    if v1 == 0:
+        return np.nan
+
+    return vq / (lag * v1)
+
+
+def sign_entropy(x):
+    x = pd.Series(x).dropna()
+
+    if len(x) < 5:
+        return np.nan
+
+    signs = np.sign(x)
+
+    probs = np.array([
+        (signs > 0).mean(),
+        (signs < 0).mean(),
+        (signs == 0).mean(),
+    ])
+
+    probs = probs[probs > 0]
+    return -np.sum(probs * np.log(probs))
+
+
+def add_contract_calendar_feature(out, df):
+    month_map = {
+        "F": 1, "G": 2, "H": 3, "J": 4, "K": 5, "M": 6,
+        "N": 7, "Q": 8, "U": 9, "V": 10, "X": 11, "Z": 12,
+    }
+
+    fut = df["FUTURES"].astype(str)
+
+    tmp = fut.str.extract(
+        r"ZC(?P<spot_month>[FGHJKMNQUVXZ])\s*(?P<future_month>[FGHJKMNQUVXZ])?(?P<yy>\d{2})"
+    )
+
+    contract_month_code = tmp["future_month"].fillna(tmp["spot_month"])
+    contract_month = contract_month_code.map(month_map)
+    contract_year = tmp["yy"].astype(float) + 2000
+
+    date = pd.to_datetime(df.index)
+
+    contract_month_start = pd.to_datetime(
+        pd.DataFrame({
+            "year": contract_year.astype(int),
+            "month": contract_month.astype(int),
+            "day": 1,
+        })
+    )
+
+    out["days_to_contract_month"] = (
+        contract_month_start.values.astype("datetime64[ns]")
+        - date.values.astype("datetime64[ns]")
+    ).astype("timedelta64[D]").astype(int)
+
+    return out
+
+def _ar1_beta(x, eps=1e-8):
+    s = pd.Series(x).dropna()
+
+    if len(s) < 5:
+        return np.nan
+
+    y = s.diff().dropna()
+    x_lag = s.shift(1).dropna().reindex(y.index)
+
+    if x_lag.std() < eps:
+        return np.nan
+
+    return np.cov(y.values, x_lag.values)[0, 1] / (x_lag.var() + eps)
+def build_features(df, eps=1e-8):
+    out = pd.DataFrame(index=df.index)
+
+    spot   = pd.to_numeric(df["MID"],       errors="coerce")
+    bid    = pd.to_numeric(df["BID"],       errors="coerce")
+    ask    = pd.to_numeric(df["OFFER"],     errors="coerce")
+    spread = pd.to_numeric(df["BA_SPREAD"], errors="coerce")
+
+    log_spot = np.log(spot.clip(lower=eps))
+    r_spot   = log_spot.diff()
+    r_lag    = r_spot.shift(1)
+
+    # ── vol_20 ───────────────────────────────────────────────
+    out["vol_20"] = r_lag.rolling(20).std()
+
+    # ── ret_20 / ret_60 ──────────────────────────────────────
+    out["ret_20"] = log_spot.shift(1) - log_spot.shift(21)
+    out["ret_60"] = log_spot.shift(1) - log_spot.shift(61)
+
+    # ── vol_skew_diff_20 ─────────────────────────────────────
+    r_down = r_lag.where(r_lag < 0, 0.0)
+    r_up   = r_lag.where(r_lag > 0, 0.0)
+    out["downside_vol_20"] = r_down.rolling(20).std()
+    out["vol_skew_diff_20"] = (
+        out["downside_vol_20"] - r_up.rolling(20).std()
+    )
+
+    # ── roll_20 (Roll estimator) ─────────────────────────────
+    log_bid = np.log(bid.clip(lower=eps))
+    log_ask = np.log(ask.clip(lower=eps))
+    r_bid   = log_bid.diff().shift(1)
+
+    cov_20 = r_bid.rolling(20).apply(
+        lambda x: np.cov(
+            pd.Series(x).dropna().values[1:],
+            pd.Series(x).dropna().values[:-1]
+        )[0, 1] if len(pd.Series(x).dropna()) > 5 else np.nan,
+        raw=False,
+    )
+    out["roll_20"] = 2.0 * np.sqrt(np.maximum(-cov_20, 0.0))
+
+    # ── illiq_proxy_20 (Amihud) ──────────────────────────────
+    rel_spread  = spread.shift(1) / (spot.shift(1) + eps)
+    illiq_daily = r_lag.abs() / (rel_spread.clip(lower=1e-5) + eps)
+    out["illiq_proxy_20"] = illiq_daily.rolling(20).mean().clip(upper=100)
+
+    # ── range_20 ─────────────────────────────────────────────
+    price_lag = spot.shift(1)
+    out["range_20"] = (
+        np.log(price_lag.rolling(20).max() + eps)
+        - np.log(price_lag.rolling(20).min() + eps)
+    )
+
+    # ── ret_kurt_20 ──────────────────────────────────────────
+    out["ret_kurt_20"] = r_lag.rolling(20).kurt()
+
+    # ── Nettoyage ────────────────────────────────────────────
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out = out.dropna()
+
+    return out#==========================================================
+# HMM
+# ============================================================
+
+def fit_hmm(X, K):
+    if HMM_TYPE == "student":
+        cfg = StudentTHMMConfig(
+            K=K,
+            n_iter=150,
+            seed=SEED,
+            cov_type="full",
+            min_var=1e-3,
+            sticky=0.5,
+            estimate_nu=False,
+            fixed_nu=6.0,
+        )
+    else:
+        cfg = GaussianHMMConfig(
+            K=K,
+            n_iter=150,
+            seed=SEED,
+            cov_type="diag",
+        )
+
+    model = create_hmm(cfg)
+    result = model.fit(X)
+
+    return model, result
+
+
+def select_k(X, k_range=(2, 3, 4)):
+    n, d = X.shape
+    rows = []
+
+    for k in k_range:
+        try:
+            model, result = fit_hmm(X, k)
+            ll = result.ll_hist[-1]
+
+            n_params = k * d + k * d + k * (k - 1) + (k - 1)
+
+            rows.append({
+                "K": k,
+                "LL": ll,
+                "BIC": -2 * ll + n_params * np.log(n),
+                "AIC": -2 * ll + 2 * n_params,
+            })
+
+        except Exception as e:
+            print(f"K={k} failed: {e}")
+
+    res = pd.DataFrame(rows)
+
+    print("\n=== HMM K SELECTION ===")
+    print(res.round(2).to_string(index=False))
+
+    return res
+
+
+# ============================================================
+# STATE INTERPRETATION
+# ============================================================
+
+def summarize_spot_states(feat, alpha, feature_cols):
+    states = np.argmax(alpha, axis=1)
+
+    df = feat.iloc[:len(states)].copy()
+    df["state"] = states
+
+    summary = (
+        df.groupby("state")[feature_cols]
+        .agg(["mean", "median", "std", "count"])
+    )
+
+    print("\n" + "=" * 80)
+    print("SPOT LATENT STATE CHARACTERIZATION")
+    print("=" * 80)
+    print(summary.round(4).to_string())
+
+    return summary
+
+
+def transition_diagnostics(A):
+    print("\n" + "=" * 80)
+    print("HMM TRANSITION DIAGNOSTICS")
+    print("=" * 80)
+
+    print("Transition matrix:")
+    print(np.round(A, 4))
+
+    expected_duration = 1.0 / (1.0 - np.diag(A))
+
+    for k, d in enumerate(expected_duration):
+        print(f"State {k}: expected duration ≈ {d:.2f} days")
+
+
+# ============================================================
+# FUTURES CONDITIONAL DYNAMICS
+# ============================================================
+
+def forward_sum(x, horizon, func=None):
+    out = pd.Series(0.0, index=x.index)
+
+    for i in range(1, horizon + 1):
+        v = x.shift(-i)
+
+        if func is not None:
+            v = func(v)
+
+        out = out + v
+
+    return out
+
+
+def build_futures_metrics(data, horizon=10, eps=1e-8):
+    df = data.copy()
+
+    price = df["FUTURES_CLOSE"].astype(float)
+    logp = np.log(price)
+    r = logp.diff()
+
+    df["rF_t"] = r
+
+    df[f"retF_fwd_{horizon}"] = forward_sum(r, horizon)
+    df[f"absF_fwd_{horizon}"] = forward_sum(r, horizon, func=lambda x: np.abs(x))
+    df[f"rvF_fwd_{horizon}"] = forward_sum(r, horizon, func=lambda x: x ** 2)
+
+    rows = []
+
+    for i in range(len(df)):
+        if i + horizon >= len(df):
+            rows.append({
+                f"rangeF_fwd_{horizon}": np.nan,
+                f"effF_fwd_{horizon}": np.nan,
+                f"signchgF_fwd_{horizon}": np.nan,
+            })
+            continue
+
+        p_win = logp.iloc[i:i + horizon + 1]
+        r_win = r.iloc[i + 1:i + horizon + 1].dropna()
+
+        if len(r_win) < 3:
+            rows.append({
+                f"rangeF_fwd_{horizon}": np.nan,
+                f"effF_fwd_{horizon}": np.nan,
+                f"signchgF_fwd_{horizon}": np.nan,
+            })
+            continue
+
+        total_ret = p_win.iloc[-1] - p_win.iloc[0]
+        path_len = r_win.abs().sum()
+
+        signs = np.sign(r_win.values)
+        signs = signs[signs != 0]
+
+        sign_change = (
+            np.mean(signs[1:] != signs[:-1])
+            if len(signs) > 1
+            else np.nan
+        )
+
+        rows.append({
+            f"rangeF_fwd_{horizon}": p_win.max() - p_win.min(),
+            f"effF_fwd_{horizon}": abs(total_ret) / (path_len + eps),
+            f"signchgF_fwd_{horizon}": sign_change,
+        })
+
+    df = df.join(pd.DataFrame(rows, index=df.index))
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    return df
+
+
+def conditional_futures_dynamics(data, alpha, index, horizon=10):
+    metrics = build_futures_metrics(data.loc[index].copy(), horizon=horizon)
+
+    states = np.argmax(alpha, axis=1)
+
+    metrics["spot_state"] = pd.Series(states, index=index)
+
+    cols = [
+        f"retF_fwd_{horizon}",
+        f"absF_fwd_{horizon}",
+        f"rvF_fwd_{horizon}",
+        f"rangeF_fwd_{horizon}",
+        f"effF_fwd_{horizon}",
+        f"signchgF_fwd_{horizon}",
+    ]
+
+    clean = metrics.dropna(subset=["spot_state"] + cols)
+
+    summary = (
+        clean.groupby("spot_state")[cols]
+        .agg(["count", "mean", "median", "std"])
+    )
+
+    print("\n" + "=" * 80)
+    print("FUTURES CONDITIONAL DYNAMICS BY SPOT STATE")
+    print("=" * 80)
+    print(summary.round(6).to_string())
+
+    print("\n" + "=" * 80)
+    print("KRUSKAL TESTS ACROSS SPOT STATES")
+    print("=" * 80)
+
+    test_rows = []
+
+    for col in cols:
+        groups = [
+            clean.loc[clean["spot_state"] == s, col].dropna().values
+            for s in sorted(clean["spot_state"].unique())
+        ]
+
+        groups = [g for g in groups if len(g) > 5]
+
+        if len(groups) >= 2:
+            h, p = stats.kruskal(*groups)
+        else:
+            h, p = np.nan, np.nan
+
+        test_rows.append({
+            "metric": col,
+            "kruskal_H": h,
+            "p_value": p,
+        })
+
+    tests = pd.DataFrame(test_rows)
+    print(tests.round(6).to_string(index=False))
+
+    return clean, summary, tests
+
+
+# ============================================================
+# EXPORTABLE DATA FEED
+# ============================================================
+
+def build_state_feed(index, alpha):
+    states = np.argmax(alpha, axis=1)
+
+    feed = pd.DataFrame(index=index)
+
+    feed["spot_state"] = states
+    feed["spot_state_confidence"] = alpha.max(axis=1)
+
+    for k in range(alpha.shape[1]):
+        feed[f"p_state_{k}"] = alpha[:, k]
+
+    return feed
+
+
+# ============================================================
+# PLOTS
+# ============================================================
+
+def plot_price_with_states(price, state_feed, title):
+    df = pd.DataFrame(index=state_feed.index)
+    df["price"] = price.reindex(state_feed.index)
+    df["state"] = state_feed["spot_state"]
+    df = df.dropna()
+
+    colors = {
+        0: "green",
+        1: "red",
+        2: "blue",
+        3: "orange",
+        4: "purple",
+    }
+
+    fig, ax = plt.subplots(figsize=(15, 6))
+
+    ax.plot(df.index, df["price"], color="black", lw=1.3, label="Price")
+
+    df["block"] = (df["state"] != df["state"].shift()).cumsum()
+
+    used = set()
+
+    for _, block in df.groupby("block"):
+        s = int(block["state"].iloc[0])
+        label = f"State {s}" if s not in used else None
+        used.add(s)
+
+        ax.axvspan(
+            block.index[0],
+            block.index[-1],
+            color=colors.get(s, "gray"),
+            alpha=0.18,
+            label=label,
+        )
+
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+def summarize_block_labels(block_labeled):
+    counts = pd.crosstab(
+        block_labeled["state"],
+        block_labeled["block_label"]
+    )
+
+    probs = counts.div(counts.sum(axis=1), axis=0)
+
+    summary = block_labeled.groupby("state")[[
+    "length", "fut_return", "fut_abs_return", "fut_efficiency",
+    "fut_rv", "fut_vol", "fut_signchg",
+    "illiq_proxy_20_block",
+]].median()
+
+    return counts, probs, summary
+
+def derive_state_labels_from_block_probs(probs, min_prob=0.35):
+    labels = {}
+
+    for state in probs.index:
+        best_label = probs.loc[state].idxmax()
+        best_prob = probs.loc[state].max()
+
+        if best_prob >= min_prob:
+            labels[int(state)] = best_label
+        else:
+            labels[int(state)] = "mixed_unclear"
+
+    return labels
+def plot_block_probabilities(block_probs, title):
+    ax = block_probs.plot(
+        kind="bar",
+        stacked=True,
+        figsize=(10, 5)
+    )
+
+    ax.set_ylabel("Probability")
+    ax.set_xlabel("HMM State")
+    ax.set_title(title)
+
+    plt.legend(title="Block Label")
+    plt.grid(alpha=0.2)
+
+    plt.tight_layout()
+    plt.show()
+    
+def plot_train_test_block_probabilities(
+    train_block_probs,
+    test_block_probs
+):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+
+    train_block_probs.plot(
+        kind="bar",
+        stacked=True,
+        ax=axes[0]
+    )
+
+    axes[0].set_title("TRAIN — Block behavior probabilities")
+    axes[0].set_xlabel("HMM State")
+    axes[0].set_ylabel("Probability")
+    axes[0].grid(alpha=0.2)
+
+    test_block_probs.plot(
+        kind="bar",
+        stacked=True,
+        ax=axes[1]
+    )
+
+    axes[1].set_title("TEST — Block behavior probabilities")
+    axes[1].set_xlabel("HMM State")
+    axes[1].grid(alpha=0.2)
+
+    handles, labels = axes[1].get_legend_handles_labels()
+
+    axes[0].legend().remove()
+    axes[1].legend(
+        handles,
+        labels,
+        title="Block Label",
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left"
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+def check_label_stability(feat_train, feat_test, train_alpha, test_alpha,
+                           feature_cols, train_index, test_index):
+    """
+    Vérifie que les états HMM ont les mêmes caractéristiques
+    entre train et test (détection du label switching).
+    Retourne un dict de remapping si nécessaire.
+    """
+    def state_means(feat, alpha, index):
+        states = np.argmax(alpha, axis=1)
+        df = feat.loc[index].copy()
+        df["state"] = states
+        return df.groupby("state")[feature_cols].mean()
+
+    train_means = state_means(feat_train, train_alpha, train_index)
+    test_means  = state_means(feat_test,  test_alpha,  test_index)
+
+    print("\n" + "=" * 80)
+    print("LABEL SWITCHING CHECK — means par état")
+    print("=" * 80)
+    print("\nTRAIN:")
+    print(train_means.round(4))
+    print("\nTEST:")
+    print(test_means.round(4))
+
+    K = train_means.shape[0]
+    
+    # Cherche le mapping test→train qui minimise la distance L2 des means
+    from itertools import permutations
+    best_perm  = list(range(K))
+    best_dist  = np.inf
+
+    for perm in permutations(range(K)):
+        dist = 0
+        for train_s, test_s in enumerate(perm):
+            if test_s in test_means.index and train_s in train_means.index:
+                dist += np.linalg.norm(
+                    train_means.loc[train_s].values
+                    - test_means.loc[test_s].values
+                )
+        if dist < best_dist:
+            best_dist = dist
+            best_perm = list(perm)
+
+    remap = {test_s: train_s for train_s, test_s in enumerate(best_perm)}
+
+    switched = any(remap[k] != k for k in remap)
+
+    print(f"\nRemapping détecté : {remap}")
+    print(f"Label switching : {'⚠️  OUI — remapping appliqué' if switched else '✅ NON — états stables'}")
+
+    return remap, switched
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print("=" * 80)
+    print("SPOT HMM LATENT STATE FEED — DATA PRODUCT VERSION")
+    print("=" * 80)
+
+    data = build_dataset(shift_spot=True)
+
+    n = len(data)
+    n_train = int(n * TRAIN_RATIO)
+
+    data_train = data.iloc[:n_train].copy()
+    data_test = data.iloc[n_train:].copy()
+
+    print(f"Train observations: {len(data_train)}")
+    print(f"Test observations : {len(data_test)}")
+
+    feat_train = build_features(data_train)
+
+    # On concat pour avoir les rolling windows continues (correct)
+    # mais on re-normalise les z-scores uniquement sur les stats train
+    feat_all_raw = build_features(pd.concat([data_train, data_test]))
+
+    # Recalcul propre des z-scores sur feat_train uniquement
+    feat_test = feat_all_raw.loc[feat_all_raw.index.isin(data_test.index)].copy()
+
+    feat_all  = feat_all_raw  # gardé pour score_and_label_blocks
+    common_cols = [
+        c for c in SELECTED_COLS
+        if c in feat_train.columns and c in feat_test.columns
+    ]
+
+    if len(common_cols) != len(SELECTED_COLS):
+        missing = set(SELECTED_COLS) - set(common_cols)
+        raise ValueError(f"Missing features: {missing}")
+
+    scaler = StandardScaler()
+
+    X_train = scaler.fit_transform(feat_train[common_cols])
+    X_test = scaler.transform(feat_test[common_cols])
+
+    X_train = np.clip(X_train, -CLIP, CLIP)
+    X_test = np.clip(X_test, -CLIP, CLIP)
+
+    if not np.isfinite(X_train).all():
+        raise ValueError("X_train contains NaN or Inf")
+
+    if not np.isfinite(X_test).all():
+        raise ValueError("X_test contains NaN or Inf")
+
+    select_k(X_train, k_range=(2, 3, 4))
+
+    model, result = fit_hmm(X_train, NB_STATES)
+
+    train_states, train_alpha, train_ll = model.filter(X_train)
+
+    pi_test = train_alpha[-1] @ model.A
+    test_states, test_alpha, test_ll = model.filter_with_pi(X_test, pi_test)
+
+    print("\n=== HMM FIT ===")
+    print("LL train:", train_ll)
+    print("LL test :", test_ll)
+
+    transition_diagnostics(model.A)
+
+    train_index = feat_train.index[:len(train_alpha)]
+    test_index = feat_test.index[:len(test_alpha)]
+
+    summarize_spot_states(
+        feat=feat_train.loc[train_index],
+        alpha=train_alpha,
+        feature_cols=common_cols,
+    )
+    remap, switched = check_label_stability(
+    feat_train, feat_test,
+    train_alpha, test_alpha,
+    feature_cols=common_cols,
+    train_index=train_index,
+    test_index=test_index,
+)
+
+# Si switching détecté, on remappe test_alpha
+    if switched:
+        test_alpha_reordered = np.zeros_like(test_alpha)
+        for test_s, train_s in remap.items():
+            test_alpha_reordered[:, train_s] = test_alpha[:, test_s]
+        test_alpha = test_alpha_reordered
+        print("test_alpha reordonné selon remap.")
+    train_feed = build_state_feed(train_index, train_alpha)
+    test_feed = build_state_feed(test_index, test_alpha)
+
+    # ============================================================
+    # BLOCK-BASED FUTURES REGIME STUDY
+    # ============================================================
+
+    train_blocks = extract_blocks_from_feed(train_feed, min_len=5)
+    test_blocks = extract_blocks_from_feed(test_feed, min_len=5)
+
+    train_block_metrics = compute_future_block_metrics(train_blocks, data)
+    test_block_metrics = compute_future_block_metrics(test_blocks, data)
+
+    train_block_labeled = score_and_label_blocks(train_block_metrics, feat_train)
+    test_block_labeled  = score_and_label_blocks(test_block_metrics,  feat_test)
+
+    train_block_counts, train_block_probs, train_block_summary = summarize_block_labels(
+        train_block_labeled
+    )
+
+    test_block_counts, test_block_probs, test_block_summary = summarize_block_labels(
+        test_block_labeled
+    )
+
+    state_labels = derive_state_labels_from_block_probs(train_block_probs)
+
+    train_feed["state_label"] = train_feed["spot_state"].map(state_labels)
+    test_feed["state_label"] = test_feed["spot_state"].map(state_labels)
+
+    print("\n" + "=" * 80)
+    print("TRAIN BLOCK-BASED FUTURES REGIME STUDY")
+    print("=" * 80)
+
+    print("\nTrain block counts by HMM state:")
+    print(train_block_counts.to_string())
+
+    print("\nTrain block probabilities by HMM state:")
+    print(train_block_probs.round(3).to_string())
+
+    print("\nTrain block median futures metrics:")
+    print(train_block_summary.round(4).to_string())
+
+    print("\nDerived HMM state labels from TRAIN block probabilities:")
+    print(state_labels)
+
+    print("\nTrain labeled blocks sample:")
+    print(train_block_labeled.tail(10).round(4).to_string())
+
+    print("\n" + "=" * 80)
+    print("TEST BLOCK-BASED FUTURES REGIME STUDY")
+    print("=" * 80)
+
+    print("\nTest block counts by HMM state:")
+    print(test_block_counts.to_string())
+
+    print("\nTest block probabilities by HMM state:")
+    print(test_block_probs.round(3).to_string())
+
+    print("\nTest block median futures metrics:")
+    print(test_block_summary.round(4).to_string())
+
+    print("\nTest labeled blocks sample:")
+    print(test_block_labeled.tail(10).round(4).to_string())
+
+    print("\n" + "=" * 80)
+    print("STATE FEED SAMPLE")
+    print("=" * 80)
+    print(test_feed.tail(10).round(4).to_string())
+
+    print("\n" + "=" * 80)
+    print("TRAIN CONDITIONAL FUTURES DYNAMICS")
+    print("=" * 80)
+
+    train_dyn, train_summary, train_tests = conditional_futures_dynamics(
+        data=data,
+        alpha=train_alpha,
+        index=train_index,
+        horizon=HORIZON,
+    )
+
+    print("\n" + "=" * 80)
+    print("TEST CONDITIONAL FUTURES DYNAMICS")
+    print("=" * 80)
+
+    test_dyn, test_summary, test_tests = conditional_futures_dynamics(
+        data=data,
+        alpha=test_alpha,
+        index=test_index,
+        horizon=HORIZON,
+    )
+
+    raw_futures = load_futures().set_index("Date")["FUTURES_CLOSE"]
+    spot_mid = data["MID"]
+
+    plot_price_with_states(
+        price=spot_mid,
+        state_feed=test_feed,
+        title="TEST — Spot MID with filtered HMM states",
+    )
+
+    plot_price_with_states(
+        price=raw_futures,
+        state_feed=test_feed,
+        title="TEST — Futures Close with spot-derived HMM states",
+    )
+
+    train_feed.to_csv("spot_hmm_state_feed_train.csv")
+    test_feed.to_csv("spot_hmm_state_feed_test.csv")
+
+    train_block_labeled.to_csv("train_future_blocks_labeled.csv", index=False)
+    test_block_labeled.to_csv("test_future_blocks_labeled.csv", index=False)
+
+    print("\nSaved:")
+    print("spot_hmm_state_feed_train.csv")
+    print("spot_hmm_state_feed_test.csv")
+    print("train_future_blocks_labeled.csv")
+    print("test_future_blocks_labeled.csv")
+    plot_block_probabilities(
+    train_block_probs,
+    title="TRAIN — Futures block behavior probabilities by HMM state"
+)
+    train_block_probs_plot = train_block_probs.drop(
+    columns=["mixed_unclear"],
+    errors="ignore"
+)
+
+    train_block_probs_plot = train_block_probs_plot.div(
+        train_block_probs_plot.sum(axis=1),
+        axis=0
+    )
+
+    test_block_probs_plot = test_block_probs.drop(
+        columns=["mixed_unclear"],
+        errors="ignore"
+    )
+
+    test_block_probs_plot = test_block_probs_plot.div(
+        test_block_probs_plot.sum(axis=1),
+        axis=0
+    )
+
+    plot_train_test_block_probabilities(
+        train_block_probs_plot,
+        test_block_probs_plot
+    )
+
+    
+    
+if __name__ == "__main__":
+    main()
