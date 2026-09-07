@@ -1,0 +1,29 @@
+# tmp data in xlsx files - will be removed once project is finished
+data/
+..old_version/
+..context_market_intel/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Secrets / config locale
+.env
+*.env
