@@ -26,6 +26,7 @@ from jumpmodels.sparse_jump import SparseJumpModel
 # ============================================================
 from typing import Any, Dict, Tuple
 from pathlib import Path
+import argparse
 
 from models.optimal_switching import (
     StochasticProcessConfig,
@@ -4945,6 +4946,20 @@ from sklearn.metrics import (
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Build the spot HMM regime feed for the corn strategy."
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=PROJECT_ROOT,
+        help="Where to write spot_hmm_state_feed_train.csv / _test.csv "
+        "(defaults to the repo root).",
+    )
+    args = parser.parse_args()
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     print("=" * 80)
     print("SPOT HMM LATENT STATE FEED — DATA PRODUCT VERSION")
     print("=" * 80)
@@ -5128,6 +5143,71 @@ def main():
     train_feed = add_hmm_diagnostics_to_feed(train_feed)
 
     test_feed = add_hmm_diagnostics_to_feed(test_feed)
+
+    # ── MODIFICATION : merge test spot ∩ futures uniquement ──────────
+    fut_test = prepare_futures()
+
+    # Validation uniquement sur dates communes spot ∩ futures
+    data_test = spot_test.join(fut_test, how="inner")
+
+    data_test = data_test[
+        data_test["FUTURES_CLOSE"].notna() & (data_test["FUTURES_CLOSE"] > 0)
+    ].copy()
+
+    print(
+        f"\ndata_test : {len(data_test)} lignes | "
+        f"{data_test.index[0].date()} → {data_test.index[-1].date()}"
+    )
+
+    # ── MODIFICATION : filtrer test_feed et reconstruire test_alpha ──
+    test_feed_val = test_feed.loc[test_feed.index.intersection(data_test.index)].copy()
+    alpha_cols = [c for c in test_feed_val.columns if c.startswith("p_state_")]
+    test_alpha_val = test_feed_val[alpha_cols].values
+
+    print(f"test_feed_val : {len(test_feed_val)} observations")
+
+    # ── MODIFICATION : diagnostic dates manquantes ───────────────────
+    print("Dates dans test_feed_val non présentes dans data_test :")
+    missing_futures_dates = test_feed.index.difference(data_test.index)
+
+    print("Dates HMM spot exclues car futures non observé :")
+    print(f"  → {len(missing_futures_dates)} dates exclues")
+
+    # ── MODIFICATION : uniquement test pour la validation futures ────
+    test_ac1 = conditional_futures_ac1_by_state(data_test, test_feed_val)
+    # ============================================================
+    # TRAIN FUTURES VALIDATION
+    # Projection des régimes spot train sur la période futures disponible
+    # de début futures jusqu'à fin train spot
+    # ============================================================
+
+    fut_all = prepare_futures()
+
+    # Garder le calendrier quotidien complet du future
+    data_train_fut = fut_all.loc[train_feed.index.min() : train_feed.index.max()].copy()
+
+    # Projeter causalement le dernier régime spot connu
+    # sur chaque date future
+    train_feed_val = train_feed.reindex(
+        data_train_fut.index,
+        method="ffill",
+    )
+
+    # Supprimer uniquement les dates avant le premier régime disponible
+    valid_mask = train_feed_val["spot_state"].notna()
+
+    data_train_fut = data_train_fut.loc[valid_mask].copy()
+
+    train_feed_val = train_feed_val.loc[valid_mask].copy()
+    alpha_cols_train = [c for c in train_feed_val.columns if c.startswith("p_state_")]
+
+    train_alpha_val = train_feed_val[alpha_cols_train].values
+    print(
+        f"\ndata_train_fut : {len(data_train_fut)} lignes | "
+        f"{data_train_fut.index[0].date()} → {data_train_fut.index[-1].date()}"
+    )
+
+    print(f"train_feed_val : {len(train_feed_val)} observations")
     # ============================================================
     # OPTIMAL SWITCHING
     # STEP 1 - STOCHASTIC PROCESS ESTIMATION
@@ -5329,70 +5409,6 @@ def main():
     print("\n[CHECK] test_feed columns after diagnostics:")
     print(test_feed.columns.tolist())
 
-    # ── MODIFICATION : merge test spot ∩ futures uniquement ──────────
-    fut_test = prepare_futures()
-
-    # Validation uniquement sur dates communes spot ∩ futures
-    data_test = spot_test.join(fut_test, how="inner")
-
-    data_test = data_test[
-        data_test["FUTURES_CLOSE"].notna() & (data_test["FUTURES_CLOSE"] > 0)
-    ].copy()
-
-    print(
-        f"\ndata_test : {len(data_test)} lignes | "
-        f"{data_test.index[0].date()} → {data_test.index[-1].date()}"
-    )
-
-    # ── MODIFICATION : filtrer test_feed et reconstruire test_alpha ──
-    test_feed_val = test_feed.loc[test_feed.index.intersection(data_test.index)].copy()
-    alpha_cols = [c for c in test_feed_val.columns if c.startswith("p_state_")]
-    test_alpha_val = test_feed_val[alpha_cols].values
-
-    print(f"test_feed_val : {len(test_feed_val)} observations")
-
-    # ── MODIFICATION : diagnostic dates manquantes ───────────────────
-    print("Dates dans test_feed_val non présentes dans data_test :")
-    missing_futures_dates = test_feed.index.difference(data_test.index)
-
-    print("Dates HMM spot exclues car futures non observé :")
-    print(f"  → {len(missing_futures_dates)} dates exclues")
-
-    # ── MODIFICATION : uniquement test pour la validation futures ────
-    test_ac1 = conditional_futures_ac1_by_state(data_test, test_feed_val)
-    # ============================================================
-    # TRAIN FUTURES VALIDATION
-    # Projection des régimes spot train sur la période futures disponible
-    # de début futures jusqu'à fin train spot
-    # ============================================================
-
-    fut_all = prepare_futures()
-
-    # Garder le calendrier quotidien complet du future
-    data_train_fut = fut_all.loc[train_feed.index.min() : train_feed.index.max()].copy()
-
-    # Projeter causalement le dernier régime spot connu
-    # sur chaque date future
-    train_feed_val = train_feed.reindex(
-        data_train_fut.index,
-        method="ffill",
-    )
-
-    # Supprimer uniquement les dates avant le premier régime disponible
-    valid_mask = train_feed_val["spot_state"].notna()
-
-    data_train_fut = data_train_fut.loc[valid_mask].copy()
-
-    train_feed_val = train_feed_val.loc[valid_mask].copy()
-    alpha_cols_train = [c for c in train_feed_val.columns if c.startswith("p_state_")]
-
-    train_alpha_val = train_feed_val[alpha_cols_train].values
-    print(
-        f"\ndata_train_fut : {len(data_train_fut)} lignes | "
-        f"{data_train_fut.index[0].date()} → {data_train_fut.index[-1].date()}"
-    )
-
-    print(f"train_feed_val : {len(train_feed_val)} observations")
 
     missing_train_futures_dates = train_feed.index.difference(data_train_fut.index)
     # ============================================================
@@ -5537,161 +5553,189 @@ def main():
     )
     # ============================================================
     # ============================================================
-    # AJOUT ADDITIF DES 3 SOUS-ÉTATS DU RÉGIME 2
-    # Aucun GMM. Aucune colonne existante n'est modifiée.
+    # DÉSACTIVÉ TEMPORAIREMENT : nécessite regime2_subhmm3_train/test.csv,
+    # produit par regime2_subhmm_3states.py (à lancer séparément, en 2e passe).
     # ============================================================
+    # # ============================================================
+    # # AJOUT ADDITIF DES 3 SOUS-ÉTATS DU RÉGIME 2
+    # # Aucun GMM. Aucune colonne existante n'est modifiée.
+    # # ============================================================
 
-    train_feed = add_regime2_subhmm3_columns(
-        train_feed,
-        split="train",
-    )
+    # train_feed = add_regime2_subhmm3_columns(
+    # train_feed,
+    # split="train",
+    # )
 
-    test_feed_val = add_regime2_subhmm3_columns(
-        test_feed_val,
-        split="test",
-    )
+    # test_feed_val = add_regime2_subhmm3_columns(
+    # test_feed_val,
+    # split="test",
+    # )
 
+    # # ============================================================
+    # # REGIME 2 — MARKET STRUCTURE TEST
+    # # AUCUNE STRATEGIE / AUCUN TRADE
+    # # ============================================================
+
+    # r2_structure_train = analyze_regime2_substate_market_structure(
+    # feat=feat_train,
+    # state_feed=train_feed,
+    # futures=futures_context,
+    # sample_name="TRAIN",
+    # price_col="FUTURES_CLOSE",
+    # horizons=(1, 3, 5, 10, 20),
+    # )
+
+    # r2_structure_test = analyze_regime2_substate_market_structure(
+    # feat=feat_test,
+    # state_feed=test_feed_val,
+    # futures=futures_context,
+    # sample_name="TEST",
+    # price_col="FUTURES_CLOSE",
+    # horizons=(1, 3, 5, 10, 20),
+    # )
+
+    # r2_structure_comparison = compare_regime2_market_structure_train_test(
+    # train_results=r2_structure_train,
+    # test_results=r2_structure_test,
+    # )
+    # # ============================================================
+    # # REGIME 2 — SUBSTATE INCREMENTAL OOS VALUE
+    # #
+    # # A = MARKET FEATURES
+    # # B = MARKET FEATURES + SUBSTATE
+    # #
+    # # AUCUN TRADE / AUCUN PNL
+    # # ============================================================
+
+    # r2_incremental_oos = analyze_regime2_substate_incremental_oos_value(
+    # train_details=r2_structure_train["details"],
+    # test_details=r2_structure_test["details"],
+    # targets=[
+    # "future_abs_path_5d",
+    # "future_abs_path_10d",
+    # "future_abs_path_20d",
+    # "future_range_5d",
+    # "future_range_10d",
+    # "future_range_20d",
+    # "future_rv_5d",
+    # "future_rv_10d",
+    # "future_rv_20d",
+    # ],
+    # n_splits=4,
+    # )
+    # # ============================================================
+    # # REGIME 2 — SUBSTATE STABILITY / PERSISTENCE
+    # # ============================================================
+
+    # (
+    # r2_train_summary,
+    # r2_train_conditional,
+    # r2_train_details,
+    # ) = analyze_regime2_substate_stability(
+    # state_feed=train_feed,
+    # sample_name="TRAIN",
+    # horizons=(1, 3, 5, 10, 20),
+    # )
+
+    # (
+    # r2_test_summary,
+    # r2_test_conditional,
+    # r2_test_details,
+    # ) = analyze_regime2_substate_stability(
+    # state_feed=test_feed_val,
+    # sample_name="TEST",
+    # horizons=(1, 3, 5, 10, 20),
+    # )
+    # # ============================================================
+    # # REGIME 2 / SUBSTATE 0 — VALIDATION ECONOMIQUE
+    # # ============================================================
+
+    # (
+    # r2_s0_econ_train,
+    # r2_s0_econ_train_details,
+    # ) = analyze_regime2_substate0_economic_validation(
+    # data=data_train_fut,
+    # state_feed=train_feed,
+    # sample_name="TRAIN",
+    # price_col="FUTURES_CLOSE",
+    # horizons=(1, 3, 5, 10),
+    # )
+
+    # (
+    # r2_s0_econ_test,
+    # r2_s0_econ_test_details,
+    # ) = analyze_regime2_substate0_economic_validation(
+    # data=data_test,
+    # state_feed=test_feed_val,
+    # sample_name="TEST",
+    # price_col="FUTURES_CLOSE",
+    # horizons=(1, 3, 5, 10),
+    # )
+
+    # r2_s0_econ_train.to_csv(
+    # "regime2_substate0_economic_train.csv",
+    # index=False,
+    # )
+
+    # r2_s0_econ_test.to_csv(
+    # "regime2_substate0_economic_test.csv",
+    # index=False,
+    # )
+
+    # r2_train_summary.to_csv(
+    # "regime2_substate_stability_train_summary.csv",
+    # index=False,
+    # )
+
+    # r2_test_summary.to_csv(
+    # "regime2_substate_stability_test_summary.csv",
+    # index=False,
+    # )
+
+    # r2_train_conditional.to_csv(
+    # "regime2_substate_stability_train_conditional.csv",
+    # index=False,
+    # )
+
+    # r2_test_conditional.to_csv(
+    # "regime2_substate_stability_test_conditional.csv",
+    # index=False,
+    # )
+
+    # r2_train_details.to_csv(
+    # "regime2_substate_stability_train_details.csv",
+    # )
+
+    # r2_test_details.to_csv(
+    # "regime2_substate_stability_test_details.csv",
+    # )
     # ============================================================
-    # REGIME 2 — MARKET STRUCTURE TEST
-    # AUCUNE STRATEGIE / AUCUN TRADE
-    # ============================================================
-
-    r2_structure_train = analyze_regime2_substate_market_structure(
-        feat=feat_train,
-        state_feed=train_feed,
-        futures=futures_context,
-        sample_name="TRAIN",
-        price_col="FUTURES_CLOSE",
-        horizons=(1, 3, 5, 10, 20),
-    )
-
-    r2_structure_test = analyze_regime2_substate_market_structure(
-        feat=feat_test,
-        state_feed=test_feed_val,
-        futures=futures_context,
-        sample_name="TEST",
-        price_col="FUTURES_CLOSE",
-        horizons=(1, 3, 5, 10, 20),
-    )
-
-    r2_structure_comparison = compare_regime2_market_structure_train_test(
-        train_results=r2_structure_train,
-        test_results=r2_structure_test,
-    )
-    # ============================================================
-    # REGIME 2 — SUBSTATE INCREMENTAL OOS VALUE
+    # RESYNC AVANT SAUVEGARDE
+    # Deux divergences distinctes, chacune dans un sens différent :
     #
-    # A = MARKET FEATURES
-    # B = MARKET FEATURES + SUBSTATE
+    # 1. TRAIN : c'est `train_feed` qui est sauvegardé (pas train_feed_val),
+    #    mais les colonnes de l'optimal switching (switch_x, switch_mu, ...)
+    #    n'ont été ajoutées qu'à `train_feed_val` (enrich_feed_with_stochastic_process,
+    #    ligne ~5284). On les récupère de train_feed_val vers train_feed.
     #
-    # AUCUN TRADE / AUCUN PNL
+    # 2. TEST : c'est `test_feed_val` qui est sauvegardé, mais abs_dd_60,
+    #    les TRADE_CONTEXT_FEATURES et les quantiles causaux n'ont été
+    #    ajoutés qu'à `test_feed` (lignes ~5311-5389). On les récupère
+    #    de test_feed vers test_feed_val.
+    #
+    # Dans les deux cas : jointure sur la date (index), sans toucher
+    # aux colonnes déjà présentes dans la version sauvegardée.
     # ============================================================
 
-    r2_incremental_oos = analyze_regime2_substate_incremental_oos_value(
-        train_details=r2_structure_train["details"],
-        test_details=r2_structure_test["details"],
-        targets=[
-            "future_abs_path_5d",
-            "future_abs_path_10d",
-            "future_abs_path_20d",
-            "future_range_5d",
-            "future_range_10d",
-            "future_range_20d",
-            "future_rv_5d",
-            "future_rv_10d",
-            "future_rv_20d",
-        ],
-        n_splits=4,
-    )
-    # ============================================================
-    # REGIME 2 — SUBSTATE STABILITY / PERSISTENCE
-    # ============================================================
+    switching_cols = [c for c in train_feed_val.columns if c not in train_feed.columns]
+    train_feed = train_feed.join(train_feed_val[switching_cols], how="left")
 
-    (
-        r2_train_summary,
-        r2_train_conditional,
-        r2_train_details,
-    ) = analyze_regime2_substate_stability(
-        state_feed=train_feed,
-        sample_name="TRAIN",
-        horizons=(1, 3, 5, 10, 20),
-    )
+    new_test_cols = [c for c in test_feed.columns if c not in test_feed_val.columns]
+    test_feed_val = test_feed_val.join(test_feed[new_test_cols], how="left")
 
-    (
-        r2_test_summary,
-        r2_test_conditional,
-        r2_test_details,
-    ) = analyze_regime2_substate_stability(
-        state_feed=test_feed_val,
-        sample_name="TEST",
-        horizons=(1, 3, 5, 10, 20),
-    )
-    # ============================================================
-    # REGIME 2 / SUBSTATE 0 — VALIDATION ECONOMIQUE
-    # ============================================================
+    train_feed.to_csv(output_dir / "spot_hmm_state_feed_train.csv")
 
-    (
-        r2_s0_econ_train,
-        r2_s0_econ_train_details,
-    ) = analyze_regime2_substate0_economic_validation(
-        data=data_train_fut,
-        state_feed=train_feed,
-        sample_name="TRAIN",
-        price_col="FUTURES_CLOSE",
-        horizons=(1, 3, 5, 10),
-    )
-
-    (
-        r2_s0_econ_test,
-        r2_s0_econ_test_details,
-    ) = analyze_regime2_substate0_economic_validation(
-        data=data_test,
-        state_feed=test_feed_val,
-        sample_name="TEST",
-        price_col="FUTURES_CLOSE",
-        horizons=(1, 3, 5, 10),
-    )
-
-    r2_s0_econ_train.to_csv(
-        "regime2_substate0_economic_train.csv",
-        index=False,
-    )
-
-    r2_s0_econ_test.to_csv(
-        "regime2_substate0_economic_test.csv",
-        index=False,
-    )
-
-    r2_train_summary.to_csv(
-        "regime2_substate_stability_train_summary.csv",
-        index=False,
-    )
-
-    r2_test_summary.to_csv(
-        "regime2_substate_stability_test_summary.csv",
-        index=False,
-    )
-
-    r2_train_conditional.to_csv(
-        "regime2_substate_stability_train_conditional.csv",
-        index=False,
-    )
-
-    r2_test_conditional.to_csv(
-        "regime2_substate_stability_test_conditional.csv",
-        index=False,
-    )
-
-    r2_train_details.to_csv(
-        "regime2_substate_stability_train_details.csv",
-    )
-
-    r2_test_details.to_csv(
-        "regime2_substate_stability_test_details.csv",
-    )
-    train_feed.to_csv(PROJECT_ROOT / "spot_hmm_state_feed_train.csv")
-
-    test_feed_val.to_csv(PROJECT_ROOT / "spot_hmm_state_feed_test.csv")
+    test_feed_val.to_csv(output_dir / "spot_hmm_state_feed_test.csv")
     switching_process.regime_params.to_csv(
         "optimal_switching_regime_diffusion_params.csv"
     )
@@ -5703,8 +5747,8 @@ def main():
     test_dyn.to_csv("test_futures_conditional_dynamics.csv", index=False)
 
     print("\nSaved:")
-    print(PROJECT_ROOT / "spot_hmm_state_feed_train.csv")
-    print(PROJECT_ROOT / "spot_hmm_state_feed_test.csv")
+    print(output_dir / "spot_hmm_state_feed_train.csv")
+    print(output_dir / "spot_hmm_state_feed_test.csv")
     print("test_futures_conditional_ac1.csv")
     print("test_futures_conditional_dynamics.csv")
 

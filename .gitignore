@@ -27,3 +27,7 @@ env/
 # Secrets / config locale
 .env
 *.env
+
+*.csv
+*.xlsx
+*.png
